@@ -1,0 +1,24 @@
+[youtube:tab] Extracting URL: https://www.youtube.com/@InfinitePlanet4K
+[youtube:tab] @InfinitePlanet4K: Downloading webpage
+[youtube:tab] Downloading all uploads of the channel. To download only the videos in a specific tab, pass the tab's URL
+[download] Downloading playlist: Infinite Planet TV - Videos
+[info] Writing playlist metadata as JSON to: D:\2.Youtube_Started\Youtube_Started\Niche_Research\InfinitePlanet4K\20260910_152053_142525\metadata\UCDA38HtNUTpGoV2fC-u8Epw.info.json
+[info] Downloading playlist thumbnail avatar_uncropped ...
+[info] Writing playlist thumbnail avatar_uncropped to: D:\2.Youtube_Started\Youtube_Started\Niche_Research\InfinitePlanet4K\20260910_152053_142525\metadata\UCDA38HtNUTpGoV2fC-u8Epw.jpg
+[youtube:tab] Playlist Infinite Planet TV - Videos: Downloading 1 items
+[download] Downloading item 1 of 1
+[youtube] Extracting URL: https://www.youtube.com/watch?v=MTkfN_0DOV0
+[youtube] Sleeping 1.0 seconds ...
+[youtube] MTkfN_0DOV0: Downloading webpage
+WARNING: [youtube] No supported JavaScript runtime could be found. Only deno is enabled by default; to use another runtime add  --js-runtimes RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS runtime has been deprecated, and some formats may be missing. See  https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one
+[youtube] Sleeping 1.0 seconds ...
+[youtube] MTkfN_0DOV0: Downloading visionos player API JSON
+[youtube] Sleeping 1.0 seconds ...
+[youtube] MTkfN_0DOV0: Downloading m3u8 information
+[info] MTkfN_0DOV0: Downloading 1 format(s): 401+251
+[info] Downloading video thumbnail 41 ...
+[info] Writing video thumbnail 41 to: D:\2.Youtube_Started\Youtube_Started\Niche_Research\InfinitePlanet4K\20260910_152053_142525\metadata\MTkfN_0DOV0.webp
+[info] Writing video metadata as JSON to: D:\2.Youtube_Started\Youtube_Started\Niche_Research\InfinitePlanet4K\20260910_152053_142525\metadata\MTkfN_0DOV0.info.json
+[MoveFiles] Moving file "D:\2.Youtube_Started\Youtube_Started\Niche_Research\InfinitePlanet4K\20260910_152053_142525\metadata\MTkfN_0DOV0.webp" to "D:\2.Youtube_Started\Youtube_Started\Niche_Research\InfinitePlanet4K\20260910_152053_142525\thumbnails\MTkfN_0DOV0.webp"
+[info] Writing updated playlist metadata as JSON to: D:\2.Youtube_Started\Youtube_Started\Niche_Research\InfinitePlanet4K\20260910_152053_142525\metadata\UCDA38HtNUTpGoV2fC-u8Epw.info.json
+[download] Finished downloading playlist: Infinite Planet TV - Videos

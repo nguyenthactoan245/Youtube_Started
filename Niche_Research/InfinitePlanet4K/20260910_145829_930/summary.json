@@ -1,0 +1,11 @@
+﻿{
+    "channel_url":  "https://www.youtube.com/@InfinitePlanet4K",
+    "started_at_utc":  "2026-09-10T07:58:30.4752626Z",
+    "finished_at_utc":  "2026-09-10T07:58:40.9427931Z",
+    "video_count":  0,
+    "missing_thumbnails":  0,
+    "missing_created_time":  0,
+    "extractor_exit_code":  1,
+    "limit_per_playlist":  1,
+    "status":  "failed"
+}
