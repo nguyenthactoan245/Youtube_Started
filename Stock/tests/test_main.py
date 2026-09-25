@@ -17,7 +17,9 @@ from models import Video
 
 class EnvironmentTests(unittest.TestCase):
     def test_dotenv_replaces_an_empty_environment_value(self) -> None:
-        with patch.dict(os.environ, {"PIXABAY_API_KEY": ""}, clear=False):
+        with patch.dict(os.environ, {"PIXABAY_API_KEY": ""}, clear=False), \
+             patch.object(Path, 'read_text', return_value='PIXABAY_API_KEY=test-key\n'), \
+             patch.object(Path, 'exists', return_value=True):
             main.load_env()
             self.assertTrue(os.environ["PIXABAY_API_KEY"])
 
@@ -32,24 +34,33 @@ class EnvironmentTests(unittest.TestCase):
                 pass
 
         page = TestPage()
-        with patch.object(main, "load_library_entries", return_value=[]):
+        with patch.object(main, "load_library_entries", return_value=[]), \
+             patch.object(main, "load_dashboard_stats", return_value=(7, 4_200_000, 3)):
             asyncio.run(main.main(page))
         self.assertEqual(len(page.controls), 1)
         self.assertTrue(callable(page.on_keyboard_event))
         self.assertTrue(page.window.maximized)
+        self.assertEqual(page.window.icon, str(main.WINDOW_ICON))
         root_row = page.controls[0]
         self.assertEqual(root_row.controls[0].width, 72)
+        self.assertEqual(root_row.controls[0].content.controls[0].content.src, main.SIDEBAR_LOGO)
         sidebar_buttons = [control for control in root_row.controls[0].content.controls if isinstance(control, main.ft.IconButton)]
-        self.assertEqual([button.tooltip for button in sidebar_buttons], ["Dashboard", "Download", "Library", "Project", "Setup"])
+        self.assertEqual([button.tooltip for button in sidebar_buttons], ["Dashboard", "Download", "Library", "Project", "Script", "Setup"])
         self.assertFalse(sidebar_buttons[2].disabled)
         self.assertFalse(sidebar_buttons[3].disabled)
+        self.assertFalse(sidebar_buttons[4].disabled)
+        self.assertTrue(callable(sidebar_buttons[4].on_click))
         panels = root_row.controls[2].content.controls
         download_view = panels[1].content
         download_layout_buttons = download_view.controls[0].controls[1].controls
         download_layout_buttons[1].on_click(None)
         self.assertIsInstance(download_view.controls[-1].content, main.ft.ListView)
-        asyncio.run(sidebar_buttons[0].on_click(None))
+        with patch.object(main, "load_dashboard_stats", return_value=(7, 4_200_000, 3)):
+            asyncio.run(sidebar_buttons[0].on_click(None))
         self.assertTrue(panels[0].visible)
+        dashboard_cards = panels[0].content.controls[-1].controls
+        self.assertEqual([card.content.controls[1].controls[0].value for card in dashboard_cards],
+                         ["7", "4.2 MB", "3"])
         with patch.object(main, "load_library_entries", return_value=[]):
             asyncio.run(sidebar_buttons[2].on_click(None))
         self.assertTrue(panels[2].visible)
@@ -61,7 +72,7 @@ class EnvironmentTests(unittest.TestCase):
         asyncio.run(sidebar_buttons[3].on_click(None))
         self.assertTrue(panels[3].visible)
         self.assertEqual(panels[3].content.controls[0].width, 260)
-        asyncio.run(sidebar_buttons[4].on_click(None))
+        asyncio.run(sidebar_buttons[5].on_click(None))
         self.assertTrue(panels[4].visible)
 
     def test_library_switch_is_cached_and_loading_is_visible(self) -> None:
@@ -166,6 +177,22 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(main.list_library_videos(root)[0], video)
         video.with_suffix(".jpg").write_bytes(b"\xff\xd8\xffposter")
         self.assertEqual(main.library_poster(video), b"\xff\xd8\xffposter")
+
+    def test_dashboard_stats_count_real_library_videos_and_projects(self) -> None:
+        root = Path(__file__).resolve().parent / ".test-work" / "dashboard-stats"
+        if root.exists():
+            __import__("shutil").rmtree(root)
+        self.addCleanup(__import__("shutil").rmtree, root, True)
+        library = root / "library"
+        nested = library / "Moscow"
+        nested.mkdir(parents=True)
+        (nested / "first.mp4").write_bytes(b"first")
+        (nested / "second.mp4").write_bytes(b"second video")
+        (nested / "ignored.jpg").write_bytes(b"image")
+        database = main.VideoDatabase(root / "data" / "stock.db")
+        database.create_project("Moscow")
+        database.create_project("Tokyo")
+        self.assertEqual(main.load_dashboard_stats(database, library), (2, 17, 2))
 
     def test_player_prefers_downloaded_video(self) -> None:
         root = __import__("pathlib").Path(__file__).resolve().parent / ".test-work" / "playable"

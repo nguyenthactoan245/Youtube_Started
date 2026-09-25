@@ -7,3 +7,8 @@ services/__pycache__/
 tests/__pycache__/
 tests/.test-work/
 .cache/
+.build-tools/
+build/
+dist/
+# Local diagnostic history
+logs/

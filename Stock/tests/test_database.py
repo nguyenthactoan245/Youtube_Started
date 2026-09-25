@@ -149,7 +149,7 @@ class DatabaseTests(unittest.TestCase):
             sidebar = page.controls[0].controls[0].content.controls
             content = page.controls[0].controls[2]
             download_view = content.content.controls[1].content
-            _, amount, start, _ = download_view.controls[2].controls
+            _, amount, start, _, _ = download_view.controls[2].controls
             download_view.controls[2].controls[0].value = 'Moscow'
             amount.value = '1'
             asyncio.run(start.on_click(None))
@@ -185,7 +185,7 @@ class DatabaseTests(unittest.TestCase):
              patch('services.downloader.urlopen', side_effect=lambda *a, **k: Response()):
             asyncio.run(main.main(page))
             download_view = page.controls[0].controls[2].content.controls[1].content
-            keyword, amount, start, _ = download_view.controls[2].controls
+            keyword, amount, start, _, _ = download_view.controls[2].controls
             keyword.value = 'Moscow'
             amount.value = '1'
             asyncio.run(start.on_click(None))

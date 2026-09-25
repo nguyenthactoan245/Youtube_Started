@@ -6,6 +6,8 @@ from pathlib import Path
 from threading import Event
 from typing import Callable
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+from services.diagnostics import record, http_fields
 
 from models import DownloadEvent, Video
 from services.database import VideoDatabase
@@ -64,6 +66,10 @@ def _download_one(video: Video, destination: Path, cancel: Event, report: Progre
             database.record(video.id, owner, "cancelled")
         report(DownloadEvent(video.id, "cancelled", 0, "Đã hủy"))
     except Exception as exc:
+        if isinstance(exc, HTTPError):
+            record(stage='download_mp4', video_id=video.id, **http_fields(exc.code, exc.headers))
+        else:
+            record(stage='download_mp4', video_id=video.id, kind='download_error', error_type=type(exc).__name__)
         temporary.unlink(missing_ok=True)
         if database and owner:
             database.record(video.id, owner, "failed", str(exc))

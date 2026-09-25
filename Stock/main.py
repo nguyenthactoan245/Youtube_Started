@@ -10,16 +10,24 @@ from threading import Event
 import flet as ft
 import flet_video as ftv
 
+from app_config import APP_VERSION, DATA_ROOT, RESOURCE_ROOT
+from services.api_keys import get_api_key_pool
+from api_key_settings import ApiKeySettings
 from models import DownloadEvent, Video
+from script_view import ScriptView
+from video_settings import build_video_settings
 from services.assets import delete_videos, export_videos, export_videos_zip
 from services.catalog import select_unique
 from services.database import VideoDatabase
 from services.downloader import download_many
-from services.pixabay import PixabayError
+from services.pixabay import PixabayError, PixabayAccessPause
 from services.thumbnails import is_jpeg, thumbnail_bytes
 
-ROOT = Path(__file__).resolve().parent
+ROOT = DATA_ROOT
 LIBRARY_ROOT = ROOT / "library"
+ASSETS_ROOT = RESOURCE_ROOT / "assets"
+WINDOW_ICON = ASSETS_ROOT / "stock-check.ico"
+SIDEBAR_LOGO = "5166961.png"
 PREVIEW_WIDTH = 1280
 PREVIEW_HEIGHT = 720
 
@@ -98,6 +106,18 @@ def load_library_entries(database: VideoDatabase) -> list[dict]:
             record["exists_on_disk"] = False
         record["poster_bytes"] = thumbnail_bytes(file) if record["exists_on_disk"] else None
     return records
+
+
+def load_dashboard_stats(database: VideoDatabase, root: Path = LIBRARY_ROOT) -> tuple[int, int, int]:
+    """Return the number and size of real MP4s in Library plus the project count."""
+    videos = list_library_videos(root)
+    total_size = 0
+    for video in videos:
+        try:
+            total_size += video.stat().st_size
+        except OSError:
+            continue
+    return len(videos), total_size, len(database.list_projects())
 
 
 def load_project_entries(database: VideoDatabase, project_id: int) -> list[dict]:
@@ -264,13 +284,14 @@ async def main(page: ft.Page) -> None:
     load_env()
     database = await asyncio.to_thread(VideoDatabase)
     await asyncio.to_thread(database.import_existing, LIBRARY_ROOT, ROOT / "downloads")
-    page.title = "Stock Downloader"
+    page.title = f"Stock Downloader v{APP_VERSION}"
     page.theme_mode = ft.ThemeMode.DARK
     page.padding = 0
     page.bgcolor = "#0b1020"
     page.window.min_width = 720
     page.window.min_height = 560
     page.window.maximized = True
+    page.window.icon = str(WINDOW_ICON)
     file_picker = ft.FilePicker()
     if hasattr(page, "services"):
         page.services.append(file_picker)
@@ -279,6 +300,8 @@ async def main(page: ft.Page) -> None:
     amount = ft.TextField(label="Số video", value="12", width=110, input_filter=ft.InputFilter(allow=True, regex_string=r"[0-9]"))
     start = ft.FilledButton("Tìm & tải", icon=ft.Icons.DOWNLOAD)
     cancel_button = ft.OutlinedButton("Hủy", icon=ft.Icons.CANCEL, disabled=True)
+    resume_search = ft.OutlinedButton("Tiếp tục tìm kiếm", visible=False,
+                                     on_click=lambda _: get_api_key_pool().resume())
     status = ft.Text("Nhập keyword và số lượng video cần tải.", color=ft.Colors.BLUE_200)
     overall = ft.ProgressBar(value=0, visible=False)
     grid = ft.GridView(expand=True, max_extent=350, child_aspect_ratio=0.95, spacing=14, run_spacing=14)
@@ -293,6 +316,8 @@ async def main(page: ft.Page) -> None:
     selected_download: set[int] = set()
     download_select_controls: dict[int, list[tuple[ft.IconButton, ft.Container]]] = {}
     download_selected_count = ft.Text("0 đã chọn", size=12, color=ft.Colors.BLUE_GREY_300)
+    video_preferences = {"quality": "2K", "orientation": "landscape"}
+    download_video_settings = build_video_settings(video_preferences)
     download_select_all = ft.IconButton(icon=ft.Icons.SELECT_ALL, tooltip="Chọn tất cả", disabled=True)
     download_delete = ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, tooltip="Xóa video đã chọn", disabled=True)
     download_save = ft.IconButton(icon=ft.Icons.DOWNLOAD, tooltip="Xuất video ra thư mục khác", disabled=True)
@@ -461,9 +486,44 @@ async def main(page: ft.Page) -> None:
         update_download_selection()
         page.update()
         try:
-            videos = await asyncio.to_thread(select_unique, os.getenv("PIXABAY_API_KEY", ""), term,
-                                              count, LIBRARY_ROOT, database, owner, cancel_event)
+            api_pool = get_api_key_pool()
+            search_worker = asyncio.create_task(asyncio.to_thread(
+                select_unique, api_pool, term, count, LIBRARY_ROOT, database, owner, cancel_event,
+                quality=video_preferences["quality"],
+                orientation=video_preferences["orientation"]))
+            while not search_worker.done():
+                await asyncio.wait({search_worker}, timeout=0.25)
+                status.value = "Đang tìm video · " + " · ".join(api_pool.statuses())
+                resume_search.visible = bool(api_pool.pause_reason) and not api_pool.auto_retrying
+                page.update()
+            videos = await search_worker
+            resume_search.visible = False
+        except PixabayAccessPause:
+            status.value = "Pixabay yêu cầu xác minh truy cập (Cloudflare). Kiểm tra trên trình duyệt rồi bấm Tiếp tục tìm kiếm."
+            status.color = ft.Colors.AMBER_300
+            while not cancel_event.is_set():
+                current_pool = get_api_key_pool()
+                resume_search.visible = bool(current_pool.pause_reason) and not current_pool.auto_retrying
+                status.value = "Đang tìm video · " + " · ".join(get_api_key_pool().statuses())
+                page.update()
+                if search_worker.done():
+                    break
+                await asyncio.wait({search_worker}, timeout=0.25)
+            try:
+                videos = await search_worker
+                resume_search.visible = False
+            except (PixabayError, OSError, InterruptedError) as exc:
+                resume_search.visible = False
+                batch.__exit__(None, None, None)
+                status.value = "Đã hủy." if cancel_event.is_set() else str(exc)
+                status.color = ft.Colors.AMBER_300 if cancel_event.is_set() else ft.Colors.RED_300
+                start.disabled = False
+                cancel_button.disabled = True
+                overall.visible = False
+                page.update()
+                return
         except (PixabayError, OSError) as exc:
+            resume_search.visible = False
             batch.__exit__(None, None, None)
             status.value = str(exc)
             status.color = ft.Colors.RED_300
@@ -562,7 +622,8 @@ async def main(page: ft.Page) -> None:
     download_view = ft.Column(expand=True, spacing=14, controls=[
             ft.Row([ft.Text("Stock Downloader", size=28, weight=ft.FontWeight.BOLD), ft.Row([download_grid_button, download_list_button], spacing=2)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             ft.Text("Tìm video Pixabay và tải trực tiếp về máy.", color=ft.Colors.BLUE_GREY_300),
-            ft.Row([keyword, amount, start, cancel_button], vertical_alignment=ft.CrossAxisAlignment.END),
+            ft.Row([keyword, amount, start, cancel_button, resume_search], vertical_alignment=ft.CrossAxisAlignment.END),
+            download_video_settings,
             status,
             overall,
             ft.Divider(color="#263250"),
@@ -571,13 +632,96 @@ async def main(page: ft.Page) -> None:
             download_results,
         ])
 
-    dashboard_view = ft.Column(spacing=10, controls=[
-        ft.Text("Dashboard", size=28, weight=ft.FontWeight.BOLD),
-        ft.Text("Tổng quan tải video sẽ xuất hiện tại đây.", color=ft.Colors.BLUE_GREY_300),
+    dashboard_video_count = ft.Text("—", size=30, weight=ft.FontWeight.BOLD)
+    dashboard_library_size = ft.Text("—", size=30, weight=ft.FontWeight.BOLD)
+    dashboard_project_count = ft.Text("—", size=30, weight=ft.FontWeight.BOLD)
+    dashboard_status = ft.Text("Mở Dashboard để cập nhật thống kê.",
+                               color=ft.Colors.BLUE_GREY_300)
+    dashboard_progress = ft.ProgressBar(value=None, visible=False)
+    dashboard_task: asyncio.Task[None] | None = None
+
+    def dashboard_card(icon: ft.IconData, label: str, value: ft.Text) -> ft.Container:
+        return ft.Container(
+            expand=True, padding=ft.Padding.all(18), border_radius=12, bgcolor="#131c33",
+            content=ft.Row(spacing=14, controls=[
+                ft.Icon(icon, size=32, color=ft.Colors.CYAN_200),
+                ft.Column(spacing=3, controls=[value,
+                                                ft.Text(label, color=ft.Colors.BLUE_GREY_300)]),
+            ]),
+        )
+
+    async def refresh_dashboard() -> None:
+        nonlocal dashboard_task
+        if dashboard_task is not None:
+            await dashboard_task
+            return
+
+        async def load() -> None:
+            dashboard_progress.visible = True
+            dashboard_status.value = "Đang cập nhật thống kê Library..."
+            page.update()
+            try:
+                videos, total_size, projects = await asyncio.to_thread(load_dashboard_stats, database)
+                dashboard_video_count.value = str(videos)
+                dashboard_library_size.value = format_size(total_size) if total_size else "0 MB"
+                dashboard_project_count.value = str(projects)
+                dashboard_status.value = "Đã cập nhật."
+                dashboard_status.color = ft.Colors.BLUE_GREY_300
+            except (OSError, sqlite3.Error):
+                dashboard_status.value = "Không thể cập nhật thống kê. Hãy thử lại."
+                dashboard_status.color = ft.Colors.RED_300
+            finally:
+                dashboard_progress.visible = False
+                page.update()
+
+        dashboard_task = asyncio.create_task(load())
+        try:
+            await dashboard_task
+        finally:
+            dashboard_task = None
+
+    async def on_dashboard_refresh(_: ft.ControlEvent) -> None:
+        await refresh_dashboard()
+
+    dashboard_view = ft.Column(spacing=14, controls=[
+        ft.Row([ft.Text("Dashboard", size=28, weight=ft.FontWeight.BOLD),
+                ft.IconButton(icon=ft.Icons.REFRESH, tooltip="Cập nhật thống kê",
+                              on_click=on_dashboard_refresh)],
+               alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+        ft.Text("Tổng quan Library và Project.", color=ft.Colors.BLUE_GREY_300),
+        dashboard_progress,
+        dashboard_status,
+        ft.Row(spacing=14, controls=[
+            dashboard_card(ft.Icons.VIDEO_LIBRARY_OUTLINED, "Video trong Library", dashboard_video_count),
+            dashboard_card(ft.Icons.STORAGE_OUTLINED, "Dung lượng Library", dashboard_library_size),
+            dashboard_card(ft.Icons.FOLDER_COPY_OUTLINED, "Projects", dashboard_project_count),
+        ]),
     ])
+    api_settings = ApiKeySettings(page, ROOT)
+    log_status = ft.Text()
+
+    async def on_export_log(_):
+        from services.diagnostics import export_log
+        try:
+            destination = await file_picker.save_file(
+                dialog_title="Xuất log lỗi", file_name="stock-diagnostic.txt",
+                file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["txt"])
+            if not destination:
+                return
+            await asyncio.to_thread(export_log, destination)
+            log_status.value = "Đã xuất log. Bạn có thể gửi file này để kiểm tra lỗi."
+        except (OSError, ValueError):
+            log_status.value = "Không thể xuất log. Hãy chọn một vị trí lưu khác."
+        page.update()
+
     setup_view = ft.Column(spacing=10, controls=[
         ft.Text("Setup", size=28, weight=ft.FontWeight.BOLD),
-        ft.Text("Pixabay API key được đọc từ file .env. Video được lưu trong thư mục library.", color=ft.Colors.BLUE_GREY_300),
+        ft.Text(f"Stock Downloader v{APP_VERSION}", color=ft.Colors.BLUE_GREY_300),
+        api_settings,
+        ft.OutlinedButton("Xuất log lỗi", icon=ft.Icons.DOWNLOAD, on_click=on_export_log),
+        log_status,
+        ft.Text(f"Thư mục dữ liệu: {ROOT}", selectable=True, color=ft.Colors.BLUE_GREY_300),
+        ft.Text(f"Video được lưu tại: {LIBRARY_ROOT}", selectable=True, color=ft.Colors.BLUE_GREY_300),
     ])
     library_count = ft.Text(color=ft.Colors.BLUE_GREY_300)
     library_list = ft.ListView(expand=True, spacing=8)
@@ -779,6 +923,7 @@ async def main(page: ft.Page) -> None:
     library_grid_button.on_click = lambda _: change_library_layout("grid")
     library_list_button.on_click = lambda _: change_library_layout("list")
     library_grid_button.bgcolor = "#20335a"
+    library_video_settings = build_video_settings(video_preferences)
     async def on_library_refresh(_: ft.ControlEvent) -> None:
         await refresh_library(force=True)
 
@@ -786,6 +931,7 @@ async def main(page: ft.Page) -> None:
         ft.Row([library_grid_button, library_list_button], alignment=ft.MainAxisAlignment.END, spacing=2),
         ft.Row([ft.Text("Library", size=28, weight=ft.FontWeight.BOLD), ft.IconButton(icon=ft.Icons.REFRESH, tooltip="Làm mới", on_click=on_library_refresh)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         ft.Row([library_count, library_search], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        library_video_settings,
         library_progress,
         ft.Row([library_select_all, library_selected_count, library_delete,
                 library_save, library_move], spacing=4),
@@ -1531,8 +1677,21 @@ async def main(page: ft.Page) -> None:
     project_save.on_click = export_project
     project_delete.on_click = delete_project
     project_move.on_click = move_project
+    def script_download_complete():
+        nonlocal library_loaded
+        library_loaded = False
+
+    script = ScriptView(page, file_picker, ROOT / "data" / "script.json", database,
+                        LIBRARY_ROOT, script_download_complete, show_library_preview,
+                        video_preferences)
+    def on_disconnect(_):
+        if cancel_event is not None:
+            cancel_event.set()
+        script.cancel.set()
+
+    page.on_disconnect = on_disconnect
     views = {"dashboard": dashboard_view, "download": download_view, "library": library_view,
-             "project": project_view, "setup": setup_view}
+             "project": project_view, "setup": setup_view, "script": script.control}
     view_panels = {name: ft.Container(content=view, visible=name == "download") for name, view in views.items()}
     content_area = ft.Container(expand=True, padding=ft.Padding.all(20),
                                 content=ft.Stack(controls=list(view_panels.values()), fit=ft.StackFit.EXPAND))
@@ -1543,6 +1702,8 @@ async def main(page: ft.Page) -> None:
         nonlocal current_view
         if name == current_view:
             return
+        if current_view == "script":
+            await script.stop_playback()
         view_panels[current_view].visible = False
         view_panels[name].visible = True
         current_view = name
@@ -1551,8 +1712,12 @@ async def main(page: ft.Page) -> None:
         page.update()
         if name == "library":
             await refresh_library()
+        elif name == "dashboard":
+            await refresh_dashboard()
         elif name == "project" and not project_loaded:
             await refresh_projects()
+        elif name == "script":
+            await script.load()
 
     def nav_button(name: str, label: str, icon: ft.IconData, disabled: bool = False) -> ft.IconButton:
         button = ft.IconButton(
@@ -1576,11 +1741,14 @@ async def main(page: ft.Page) -> None:
         bgcolor="#10182c",
         padding=ft.Padding.all(8),
         content=ft.Column(expand=True, controls=[
-            ft.Container(height=48, alignment=ft.Alignment(0, 0), content=ft.Icon(ft.Icons.VIDEO_LIBRARY_OUTLINED, color=ft.Colors.CYAN_200)),
+            ft.Container(height=48, alignment=ft.Alignment(0, 0), tooltip="Stock Downloader",
+                         content=ft.Image(src=SIDEBAR_LOGO, width=38, height=38,
+                                          fit=ft.BoxFit.CONTAIN)),
             nav_button("dashboard", "Dashboard", ft.Icons.DASHBOARD_OUTLINED),
             download_button,
             nav_button("library", "Library", ft.Icons.VIDEO_LIBRARY_OUTLINED),
             nav_button("project", "Project", ft.Icons.FOLDER_OUTLINED),
+            nav_button("script", "Script", ft.Icons.DESCRIPTION_OUTLINED),
             ft.Container(expand=True),
             ft.Divider(color="#263250"),
             nav_button("setup", "Setup", ft.Icons.SETTINGS_OUTLINED),
@@ -1596,4 +1764,6 @@ async def main(page: ft.Page) -> None:
 
 
 if __name__ == "__main__":
-    ft.run(main)
+    from services.diagnostics import enable_logging
+    enable_logging()
+    ft.run(main, assets_dir=str(ASSETS_ROOT))

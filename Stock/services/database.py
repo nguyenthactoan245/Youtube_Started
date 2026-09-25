@@ -12,8 +12,9 @@ from pathlib import Path
 from threading import Event, Thread
 
 from models import Video
+from app_config import DATA_ROOT
 
-DEFAULT_DB = Path(__file__).resolve().parents[1] / "data" / "stock.db"
+DEFAULT_DB = DATA_ROOT / "data" / "stock.db"
 LEASE_SECONDS = 120
 
 
