@@ -48,6 +48,22 @@ class AppConfigTests(unittest.TestCase):
                 app_config.save_api_key(value, self.root)
         self.assertFalse((self.root / ".env").exists())
 
+    def test_save_pexels_key_preserves_pixabay_configuration_and_can_clear(self):
+        with patch.dict(os.environ, {}, clear=True):
+            (self.root / ".env").write_text("PIXABAY_API_KEYS=alpha,beta\nOTHER=value\n", encoding="utf-8")
+            app_config.save_pexels_api_key(" pexels-key_123 ", self.root)
+            self.assertEqual(app_config.configured_pexels_api_key(), "pexels-key_123")
+            saved = (self.root / ".env").read_text(encoding="utf-8")
+            self.assertIn("PIXABAY_API_KEYS=alpha,beta", saved)
+            self.assertIn("OTHER=value", saved)
+            app_config.save_pexels_api_key("", self.root)
+            self.assertEqual(app_config.configured_pexels_api_key(), "")
+            self.assertNotIn("PEXELS_API_KEY=", (self.root / ".env").read_text(encoding="utf-8"))
+
+    def test_rejects_invalid_pexels_key_characters(self):
+        with self.assertRaises(ValueError):
+            app_config.save_pexels_api_key("not a valid key", self.root)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,8 @@ import asyncio
 
 import flet as ft
 
-from app_config import configured_api_keys, save_api_keys
+from app_config import (configured_api_keys, configured_pexels_api_key, save_api_keys,
+                       save_pexels_api_key)
 from services.api_keys import get_api_key_pool
 
 
@@ -16,7 +17,12 @@ class ApiKeySettings(ft.Column):
         self.rows = ft.Column(spacing=8, scroll=ft.ScrollMode.AUTO, height=220)
         self.status = ft.Text()
         self.key_status = ft.Text()
+        self.pexels_status = ft.Text()
+        self.pexels_field = ft.TextField(label="Pexels API key", value=configured_pexels_api_key(),
+                                         password=True, can_reveal_password=True, width=640, height=56)
         self.save_button = ft.FilledButton("Lưu danh sách key", icon=ft.Icons.SAVE, on_click=self.save)
+        self.save_pexels_button = ft.OutlinedButton("Lưu Pexels key", icon=ft.Icons.SAVE,
+                                                    on_click=self.save_pexels)
         self.controls = [
             ft.Text("Pixabay API keys", weight=ft.FontWeight.BOLD),
             ft.Text("Thêm hoặc xóa key rồi bấm Lưu. Key được dùng luân phiên khi tìm video."),
@@ -27,6 +33,11 @@ class ApiKeySettings(ft.Column):
                 ft.OutlinedButton("Cập nhật trạng thái", icon=ft.Icons.REFRESH, on_click=self.refresh),
             ], wrap=True),
             self.status, self.key_status,
+            ft.Divider(),
+            ft.Text("Pexels API key", weight=ft.FontWeight.BOLD),
+            ft.Text("Key này dùng riêng cho tìm và tải footage từ Pexels."),
+            ft.Row([self.pexels_field, self.save_pexels_button], wrap=True),
+            self.pexels_status,
         ]
         for key in configured_api_keys() or [""]:
             self.append_field(key)
@@ -87,4 +98,23 @@ class ApiKeySettings(ft.Column):
         finally:
             self.disabled = False
             self.save_button.disabled = False
+            self.host_page.update()
+
+    async def save_pexels(self, _):
+        if self.save_pexels_button.disabled:
+            return
+        self.disabled = True
+        self.save_pexels_button.disabled = True
+        self.host_page.update()
+        try:
+            key = await asyncio.to_thread(save_pexels_api_key, self.pexels_field.value or "", self.root)
+            self.pexels_status.value = "Đã lưu Pexels API key." if key else "Đã xóa Pexels API key."
+            self.pexels_status.color = ft.Colors.GREEN_300
+        except (OSError, ValueError) as exc:
+            self.pexels_status.value = (str(exc) if isinstance(exc, ValueError)
+                                        else "Không thể lưu Pexels API key. Hãy kiểm tra quyền ghi thư mục dữ liệu.")
+            self.pexels_status.color = ft.Colors.RED_300
+        finally:
+            self.disabled = False
+            self.save_pexels_button.disabled = False
             self.host_page.update()

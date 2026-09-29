@@ -1,4 +1,4 @@
-"""Read Footage Tracker XLSX values without executing formulas or external links."""
+"""Read supported script tracker XLSX files without formulas or external links."""
 from __future__ import annotations
 
 import json
@@ -22,9 +22,9 @@ def read_tracker(path: Path) -> dict:
                 raise ValueError("File Excel quá lớn (giới hạn 40 MB sau giải nén).")
             workbook = ET.fromstring(archive.read("xl/workbook.xml"))
             sheet = next((s for s in workbook.findall("m:sheets/m:sheet", NS)
-                          if s.get("name") == "Footage Tracker"), None)
+                          if s.get("name") in {"Footage Tracker", "Visual Beat Tracker"}), None)
             if sheet is None:
-                raise ValueError("Không tìm thấy sheet Footage Tracker.")
+                raise ValueError("Không tìm thấy sheet Footage Tracker hoặc Visual Beat Tracker.")
             relationships = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
             target = next(r.attrib["Target"] for r in relationships
                           if r.get("Id") == sheet.get(REL) and r.get("TargetMode") != "External")
@@ -57,15 +57,35 @@ def read_tracker(path: Path) -> dict:
                     raise ValueError("Sheet vượt quá 10.000 cảnh.")
     except (zipfile.BadZipFile, KeyError, ET.ParseError, StopIteration, IndexError) as exc:
         raise ValueError("File Excel không hợp lệ hoặc bị hỏng.") from exc
-    if not rows or rows[0][0].strip() != "Scene ID" or "Voice-over (original)" not in rows[0]:
-        raise ValueError("Sheet cần có cột Scene ID và Voice-over (original).")
+    if not rows:
+        raise ValueError("Sheet không có tiêu đề.")
     headers = rows[0]
+    standard = headers[0].strip() == "Scene ID" and "Voice-over (original)" in headers
+    alaska = (headers[0].strip() == "Beat ID" and "Voice-over Beat" in headers
+              and "Primary Stock Keyword" in headers)
+    if not (standard or alaska):
+        raise ValueError("Cần các cột Scene ID và Voice-over (original), hoặc Beat ID, Voice-over Beat và Primary Stock Keyword.")
     if len(rows) < 2:
-        raise ValueError("Sheet Footage Tracker chưa có cảnh nào.")
+        raise ValueError("Sheet tracker chưa có cảnh nào.")
     if any(len(row) > len(headers) for row in rows[1:]):
         raise ValueError("Có dữ liệu nằm ngoài các cột tiêu đề.")
-    return {"filename": path.name, "headers": headers,
-            "rows": [row + [""] * (len(headers) - len(row)) for row in rows[1:]]}
+    data_rows = [row + [""] * (len(headers) - len(row)) for row in rows[1:]]
+    if alaska:
+        # Keep every source field visible while supplying the canonical fields used by Script actions.
+        mapping = {
+            "Scene ID": "Beat ID",
+            "Voice-over (original)": "Voice-over Beat",
+            "Primary search keyword": "Primary Stock Keyword",
+            "Alternative search keyword": "Alternative Keywords",
+            "Suggested shot": "Shot Type",
+            "Selected clip URL / file": "Footage URL",
+            "File Name": "File Name",
+        }
+        headers = [*headers, *[name for name in mapping if name not in headers]]
+        for row in data_rows:
+            source = dict(zip(rows[0], row))
+            row.extend(source.get(mapping[name], "") for name in mapping if name not in rows[0])
+    return {"filename": path.name, "headers": headers, "rows": data_rows}
 
 
 def save_tracker(data: dict, target: Path) -> None:

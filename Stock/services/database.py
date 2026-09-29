@@ -151,39 +151,57 @@ class VideoDatabase:
                 WHERE owner=? AND status IN ('queued','downloading')""", (time.time(), owner))
             db.execute("DELETE FROM batches WHERE id=?", (owner,))
 
-    def reserve(self, video: Video, keyword: str, target: Path, owner: str) -> bool:
+    def reserve(self, video: Video, keyword: str, target: Path, owner: str, filename_prefix: str = "") -> bool:
         now = time.time()
+        source = getattr(video, "source", "pixabay")
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if not db.execute("SELECT 1 FROM batches WHERE id=?", (owner,)).fetchone():
                 raise RuntimeError("Lượt tải đã hết hiệu lực.")
-            row = db.execute("SELECT status, hidden_at FROM videos WHERE source='pixabay' AND video_id=?",
-                             (video.id,)).fetchone()
+            row = db.execute("SELECT status, hidden_at FROM videos WHERE source=? AND video_id=?",
+                             (source, video.id)).fetchone()
             if row and row['hidden_at'] is None and row['status'] not in ('failed', 'cancelled'):
-                return False
+                # A replacement in Script may reserve the same Pixabay ID again.
+                if not filename_prefix or row['status'] != 'completed':
+                    return False
+                existing = db.execute("SELECT file_path FROM videos WHERE source=? AND video_id=?",
+                                      (source, video.id)).fetchone()
+                if existing and Path(existing['file_path']).name.startswith(filename_prefix):
+                    return False
+                # Keep the old file intact and let the caller save the replacement
+                # under its beat label; this record will point to the new path.
             db.execute("""INSERT INTO videos
                 (source, video_id, metadata, keyword, file_path, status, owner, created_at, updated_at)
-                VALUES ('pixabay', ?, ?, ?, ?, 'queued', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
                 ON CONFLICT(source, video_id) DO UPDATE SET
                 metadata=excluded.metadata, keyword=excluded.keyword, file_path=excluded.file_path,
                 status='queued', owner=excluded.owner, error='', hidden_at=NULL,
                 updated_at=excluded.updated_at""",
-                (video.id, json.dumps(asdict(video), ensure_ascii=False), keyword, str(target.resolve()), owner, now, now))
+                (source, video.id, json.dumps(asdict(video), ensure_ascii=False), keyword,
+                 str(target.resolve()), owner, now, now))
             return True
 
-    def owns(self, video_id: int, owner: str) -> bool:
+    def owns(self, video_id: int, owner: str, source: str = "pixabay") -> bool:
         with self.connect() as db:
-            return db.execute("""SELECT 1 FROM videos WHERE source='pixabay'
-                AND video_id=? AND owner=? AND status IN ('queued','downloading')""", (video_id, owner)).fetchone() is not None
+            return db.execute("""SELECT 1 FROM videos WHERE source=?
+                AND video_id=? AND owner=? AND status IN ('queued','downloading')""",
+                (source, video_id, owner)).fetchone() is not None
 
-    def record(self, video_id: int, owner: str, status: str, error: str = ''):
+    def record(self, video_id: int, owner: str, status: str, error: str = '', source: str = "pixabay"):
         with self.connect() as db:
             db.execute("""UPDATE videos SET status=?, error=?, updated_at=?,
                 completed_at=CASE WHEN ?='completed' THEN ? ELSE completed_at END,
                 thumbnail_path=CASE WHEN ?='completed' THEN substr(file_path,1,length(file_path)-4)||'.jpg' ELSE thumbnail_path END,
                 owner=CASE WHEN ? IN ('completed','failed','cancelled') THEN NULL ELSE owner END
-                WHERE source='pixabay' AND video_id=? AND owner=?""",
-                (status, error, time.time(), status, time.time(), status, status, video_id, owner))
+                WHERE source=? AND video_id=? AND owner=?""",
+                (status, error, time.time(), status, time.time(), status, status, source, video_id, owner))
+
+    def set_file_path(self, video_id: int, file_path: Path, source: str = "pixabay") -> None:
+        """Update a reserved record to the final Script filename."""
+        resolved = str(Path(file_path).resolve())
+        with self.connect() as db:
+            db.execute("UPDATE videos SET file_path=?, thumbnail_path=?, updated_at=? WHERE source=? AND video_id=?",
+                       (resolved, str(Path(resolved).with_suffix('.jpg')), time.time(), source, video_id))
 
     def library(self) -> list[dict]:
         with self.connect() as db:
@@ -350,7 +368,7 @@ class VideoDatabase:
                         continue
                     if not stat.st_size:
                         continue
-                    match = re.fullmatch(r'(\d+)_(\d+)x(\d+)', file.stem)
+                    match = re.fullmatch(r'(?:(\d+)|VB\d+_.+?)_(\d+)x(\d+)', file.stem, re.IGNORECASE)
                     video_id = int(match[1]) if match else None
                     details = {'tags': file.stem, 'size': stat.st_size}
                     if match:

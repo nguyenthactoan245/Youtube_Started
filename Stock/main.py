@@ -10,17 +10,18 @@ from threading import Event
 import flet as ft
 import flet_video as ftv
 
-from app_config import APP_VERSION, DATA_ROOT, RESOURCE_ROOT
+from app_config import APP_VERSION, DATA_ROOT, RESOURCE_ROOT, configured_pexels_api_key
 from services.api_keys import get_api_key_pool
 from api_key_settings import ApiKeySettings
 from models import DownloadEvent, Video
-from script_view import ScriptView
+from script_view import ScriptWorkspace
 from video_settings import build_video_settings
 from services.assets import delete_videos, export_videos, export_videos_zip
 from services.catalog import select_unique
 from services.database import VideoDatabase
-from services.downloader import download_many
+from services.downloader import download_many, footage_filename
 from services.pixabay import PixabayError, PixabayAccessPause
+from services.pexels import PexelsError, select_unique as select_pexels_unique
 from services.thumbnails import is_jpeg, thumbnail_bytes
 
 ROOT = DATA_ROOT
@@ -142,8 +143,8 @@ def load_project_entries(database: VideoDatabase, project_id: int) -> list[dict]
 
 
 def playable_resource(video: Video, root: Path = LIBRARY_ROOT) -> str:
-    """Prefer a completed local MP4; fall back to the Pixabay stream while downloading."""
-    filename = f"{video.id}_{video.width}x{video.height}.mp4"
+    """Prefer a completed local MP4; fall back to its provider stream while downloading."""
+    filename = footage_filename(video)
     if root.exists():
         local_file = next(root.rglob(filename), None)
         if local_file and local_file.stat().st_size > 0:
@@ -211,7 +212,7 @@ def build_preview_dialog(
                 controls=[
                     frame,
                     ft.Text(f"{video.width}×{video.height} · {format_duration(video.duration)} · {format_size(video.size)}", height=20, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, color=ft.Colors.BLUE_GREY_300),
-                    ft.Text(f"Video by {video.author} on Pixabay", height=20, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, size=12, color=ft.Colors.BLUE_GREY_300),
+                    ft.Text(f"Video by {video.author} on {video.source.title()}", height=20, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, size=12, color=ft.Colors.BLUE_GREY_300),
                 ],
             ),
         ),
@@ -316,8 +317,8 @@ async def main(page: ft.Page) -> None:
     selected_download: set[int] = set()
     download_select_controls: dict[int, list[tuple[ft.IconButton, ft.Container]]] = {}
     download_selected_count = ft.Text("0 đã chọn", size=12, color=ft.Colors.BLUE_GREY_300)
-    video_preferences = {"quality": "2K", "orientation": "landscape"}
-    download_video_settings = build_video_settings(video_preferences)
+    video_preferences = {"quality": "2K", "orientation": "landscape", "source": "pixabay"}
+    download_video_settings = build_video_settings(video_preferences, include_source=True)
     download_select_all = ft.IconButton(icon=ft.Icons.SELECT_ALL, tooltip="Chọn tất cả", disabled=True)
     download_delete = ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, tooltip="Xóa video đã chọn", disabled=True)
     download_save = ft.IconButton(icon=ft.Icons.DOWNLOAD, tooltip="Xuất video ra thư mục khác", disabled=True)
@@ -418,7 +419,9 @@ async def main(page: ft.Page) -> None:
                                     tooltip=video.tags, weight=ft.FontWeight.W_600),
                             ft.Text(f"{video.width}×{video.height} · {format_size(video.size)}", size=11, color=ft.Colors.BLUE_GREY_300),
                             progress,
-                            ft.Row([state, ft.TextButton("Pixabay", url=video.page_url, style=ft.ButtonStyle(padding=0))], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                            ft.Row([state, ft.TextButton(f"{video.source.title()} · {video.author}",
+                                url=video.page_url, style=ft.ButtonStyle(padding=0))],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                         ]),
                     ),
                 ],
@@ -458,6 +461,10 @@ async def main(page: ft.Page) -> None:
         if start.disabled:
             return
         term = keyword.value.strip()
+        selected_source = getattr(download_video_settings, "source_dropdown", None)
+        source_name = ((selected_source.value if selected_source else None)
+                       or video_preferences.get("source", "pixabay")).lower()
+        video_preferences["source"] = source_name
         try:
             count = int(amount.value)
             if not term or not 1 <= count <= 200:
@@ -468,12 +475,19 @@ async def main(page: ft.Page) -> None:
             page.update()
             return
 
+        pexels_key = configured_pexels_api_key() if source_name == "pexels" else ""
+        if source_name == "pexels" and not pexels_key:
+            status.value = "Hãy nhập Pexels API key trong Setup trước khi tải."
+            status.color = ft.Colors.RED_300
+            page.update()
+            return
+
         start.disabled = True
         cancel_button.disabled = False
         cancel_event = Event()
         batch = database.batch()
         owner = batch.__enter__()
-        status.value = "Đang tìm video trên Pixabay..."
+        status.value = f"Đang tìm video trên {source_name.title()}..."
         status.color = ft.Colors.BLUE_200
         overall.visible = True
         overall.value = None
@@ -486,15 +500,24 @@ async def main(page: ft.Page) -> None:
         update_download_selection()
         page.update()
         try:
-            api_pool = get_api_key_pool()
-            search_worker = asyncio.create_task(asyncio.to_thread(
-                select_unique, api_pool, term, count, LIBRARY_ROOT, database, owner, cancel_event,
-                quality=video_preferences["quality"],
-                orientation=video_preferences["orientation"]))
+            api_pool = get_api_key_pool() if source_name == "pixabay" else None
+            if source_name == "pexels":
+                search_worker = asyncio.create_task(asyncio.to_thread(
+                    select_pexels_unique, pexels_key, term, count, LIBRARY_ROOT, database, owner, cancel_event,
+                    quality=video_preferences["quality"], orientation=video_preferences["orientation"]))
+            else:
+                search_worker = asyncio.create_task(asyncio.to_thread(
+                    select_unique, api_pool, term, count, LIBRARY_ROOT, database, owner, cancel_event,
+                    quality=video_preferences["quality"],
+                    orientation=video_preferences["orientation"]))
             while not search_worker.done():
                 await asyncio.wait({search_worker}, timeout=0.25)
-                status.value = "Đang tìm video · " + " · ".join(api_pool.statuses())
-                resume_search.visible = bool(api_pool.pause_reason) and not api_pool.auto_retrying
+                if source_name == "pexels":
+                    status.value = f"Đang tìm video trên Pexels · {term}..."
+                    resume_search.visible = False
+                else:
+                    status.value = "Đang tìm video · " + " · ".join(api_pool.statuses())
+                    resume_search.visible = bool(api_pool.pause_reason) and not api_pool.auto_retrying
                 page.update()
             videos = await search_worker
             resume_search.visible = False
@@ -512,7 +535,7 @@ async def main(page: ft.Page) -> None:
             try:
                 videos = await search_worker
                 resume_search.visible = False
-            except (PixabayError, OSError, InterruptedError) as exc:
+            except (PixabayError, PexelsError, OSError, InterruptedError) as exc:
                 resume_search.visible = False
                 batch.__exit__(None, None, None)
                 status.value = "Đã hủy." if cancel_event.is_set() else str(exc)
@@ -522,7 +545,7 @@ async def main(page: ft.Page) -> None:
                 overall.visible = False
                 page.update()
                 return
-        except (PixabayError, OSError) as exc:
+        except (PixabayError, PexelsError, OSError) as exc:
             resume_search.visible = False
             batch.__exit__(None, None, None)
             status.value = str(exc)
@@ -534,7 +557,8 @@ async def main(page: ft.Page) -> None:
             return
         if not videos:
             batch.__exit__(None, None, None)
-            status.value = "Đã hủy." if cancel_event.is_set() else "Không còn video mới phù hợp trên Pixabay cho keyword này."
+            status.value = ("Đã hủy." if cancel_event.is_set() else
+                            f"Không còn video mới phù hợp trên {source_name.title()} cho keyword này.")
             status.color = ft.Colors.AMBER_300
             start.disabled = False
             cancel_button.disabled = True
@@ -621,7 +645,7 @@ async def main(page: ft.Page) -> None:
     download_grid_button.bgcolor = "#20335a"
     download_view = ft.Column(expand=True, spacing=14, controls=[
             ft.Row([ft.Text("Stock Downloader", size=28, weight=ft.FontWeight.BOLD), ft.Row([download_grid_button, download_list_button], spacing=2)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            ft.Text("Tìm video Pixabay và tải trực tiếp về máy.", color=ft.Colors.BLUE_GREY_300),
+            ft.Text("Tìm footage theo nguồn đã chọn và tải trực tiếp về máy.", color=ft.Colors.BLUE_GREY_300),
             ft.Row([keyword, amount, start, cancel_button, resume_search], vertical_alignment=ft.CrossAxisAlignment.END),
             download_video_settings,
             status,
@@ -714,7 +738,7 @@ async def main(page: ft.Page) -> None:
             log_status.value = "Không thể xuất log. Hãy chọn một vị trí lưu khác."
         page.update()
 
-    setup_view = ft.Column(spacing=10, controls=[
+    setup_view = ft.Column(spacing=10, scroll=ft.ScrollMode.AUTO, controls=[
         ft.Text("Setup", size=28, weight=ft.FontWeight.BOLD),
         ft.Text(f"Stock Downloader v{APP_VERSION}", color=ft.Colors.BLUE_GREY_300),
         api_settings,
@@ -923,7 +947,6 @@ async def main(page: ft.Page) -> None:
     library_grid_button.on_click = lambda _: change_library_layout("grid")
     library_list_button.on_click = lambda _: change_library_layout("list")
     library_grid_button.bgcolor = "#20335a"
-    library_video_settings = build_video_settings(video_preferences)
     async def on_library_refresh(_: ft.ControlEvent) -> None:
         await refresh_library(force=True)
 
@@ -931,7 +954,6 @@ async def main(page: ft.Page) -> None:
         ft.Row([library_grid_button, library_list_button], alignment=ft.MainAxisAlignment.END, spacing=2),
         ft.Row([ft.Text("Library", size=28, weight=ft.FontWeight.BOLD), ft.IconButton(icon=ft.Icons.REFRESH, tooltip="Làm mới", on_click=on_library_refresh)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
         ft.Row([library_count, library_search], vertical_alignment=ft.CrossAxisAlignment.CENTER),
-        library_video_settings,
         library_progress,
         ft.Row([library_select_all, library_selected_count, library_delete,
                 library_save, library_move], spacing=4),
@@ -1681,13 +1703,13 @@ async def main(page: ft.Page) -> None:
         nonlocal library_loaded
         library_loaded = False
 
-    script = ScriptView(page, file_picker, ROOT / "data" / "script.json", database,
-                        LIBRARY_ROOT, script_download_complete, show_library_preview,
-                        video_preferences)
+    script = ScriptWorkspace(page, file_picker, ROOT / "data", database,
+                             LIBRARY_ROOT, script_download_complete, show_library_preview,
+                             video_preferences)
     def on_disconnect(_):
         if cancel_event is not None:
             cancel_event.set()
-        script.cancel.set()
+        script.cancel_active()
 
     page.on_disconnect = on_disconnect
     views = {"dashboard": dashboard_view, "download": download_view, "library": library_view,

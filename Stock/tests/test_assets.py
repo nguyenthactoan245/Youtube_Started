@@ -55,6 +55,16 @@ class AssetTests(unittest.TestCase):
             export_videos_zip([first, second], archive)
         self.assertEqual(first.read_bytes(), b"first video")
 
+    def test_export_zip_uses_visual_beat_names(self):
+        source = self.library / "302122_2560x1440.mp4"
+        source.write_bytes(b"video")
+        archive = self.root / "visual-beats.zip"
+        self.assertEqual(export_videos_zip(
+            [source], archive, ["VB001_Alaska_North_America_2560x1440.mp4"]), (1, 0))
+        with zipfile.ZipFile(archive) as contents:
+            self.assertEqual(contents.namelist(), ["VB001_Alaska_North_America_2560x1440.mp4"])
+            self.assertEqual(contents.read(contents.namelist()[0]), b"video")
+
     def test_delete_removes_files_and_database_id_can_be_downloaded_again(self):
         source = self.library / "42_1280x720.mp4"
         poster = source.with_suffix(".jpg")

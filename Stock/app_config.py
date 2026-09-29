@@ -36,6 +36,30 @@ def configured_api_keys() -> list[str]:
                           or os.getenv("PIXABAY_API_KEY", ""))
 
 
+def configured_pexels_api_key() -> str:
+    return os.getenv("PEXELS_API_KEY", "").strip()
+
+
+def save_pexels_api_key(value: str, root: Path = DATA_ROOT) -> str:
+    value = value.strip()
+    if value and not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("Pexels API key chỉ được chứa chữ, số, dấu gạch ngang và gạch dưới.")
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / ".env"
+    lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
+    lines = [line for line in lines if line.split("=", 1)[0].strip() != "PEXELS_API_KEY"]
+    if value:
+        lines.append(f"PEXELS_API_KEY={value}")
+    temporary = target.with_suffix(".env.tmp")
+    temporary.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    temporary.replace(target)
+    if value:
+        os.environ["PEXELS_API_KEY"] = value
+    else:
+        os.environ.pop("PEXELS_API_KEY", None)
+    return value
+
+
 def save_api_keys(value: str, root: Path = DATA_ROOT) -> list[str]:
     keys = parse_api_keys(value)
     root.mkdir(parents=True, exist_ok=True)

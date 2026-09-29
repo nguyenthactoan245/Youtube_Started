@@ -33,8 +33,9 @@ def export_videos(paths: list[Path], destination: Path) -> tuple[int, int]:
     return copied, skipped
 
 
-def export_videos_zip(paths: list[Path], destination: Path) -> tuple[int, int]:
-    """Create a new ZIP archive from MP4 files without overwriting an existing file."""
+def export_videos_zip(paths: list[Path], destination: Path,
+                      names: list[str] | None = None) -> tuple[int, int]:
+    """Create a new ZIP archive, optionally using one requested name per video."""
     if destination.suffix.lower() != ".zip":
         raise ValueError("File xuất phải có đuôi .zip.")
     if not destination.parent.is_dir():
@@ -43,11 +44,14 @@ def export_videos_zip(paths: list[Path], destination: Path) -> tuple[int, int]:
     used_names: set[str] = set()
     try:
         with zipfile.ZipFile(destination, mode="x", compression=zipfile.ZIP_DEFLATED) as archive:
-            for path in paths:
+            for position, path in enumerate(paths):
                 if not path.is_file():
                     skipped += 1
                     continue
-                name = path.name
+                requested = names[position] if names and position < len(names) else ""
+                name = Path(requested).name if requested else path.name
+                if Path(name).suffix.lower() != path.suffix.lower():
+                    name = f"{Path(name).stem}{path.suffix}"
                 index = 2
                 while name.casefold() in used_names:
                     name = f"{path.stem} ({index}){path.suffix}"

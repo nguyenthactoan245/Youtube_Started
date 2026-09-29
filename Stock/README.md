@@ -1,12 +1,12 @@
-# Stock Downloader
+﻿# Stock Downloader
 
-Ứng dụng desktop Flet tìm video từ Pixabay rồi tải về máy, hiển thị mỗi thumbnail theo tỉ lệ 16:9 trong grid responsive.
+Ứng dụng desktop Flet tìm video stock từ Pixabay rồi tải về máy, hiển thị mỗi thumbnail theo tỉ lệ 16:9 trong grid responsive. Pexels API key có thể được cấu hình trong Setup để dùng cho tích hợp Pexels.
 
 ## Chạy ứng dụng
 
 1. Mở PowerShell tại thư mục `Stock`.
 2. Cài Flet nếu máy chưa có: `python -m pip install -r requirements.txt`.
-3. Vào **Setup → Thêm key → Lưu danh sách key**, hoặc tạo `.env` từ `.env.example` và điền `PIXABAY_API_KEYS=key_1,key_2`. Cấu hình cũ `PIXABAY_API_KEY` vẫn được hỗ trợ nếu danh sách mới trống. File `.env` không được Git theo dõi.
+3. Vào **Setup → Thêm key → Lưu danh sách key** để cấu hình Pixabay và ô **Pexels API key → Lưu Pexels key** để cấu hình Pexels; hoặc tạo `.env` từ `.env.example` và điền `PIXABAY_API_KEYS=key_1,key_2` cùng `PEXELS_API_KEY=...`. Cấu hình cũ `PIXABAY_API_KEY` vẫn được hỗ trợ nếu danh sách mới trống. File `.env` không được Git theo dõi.
 
 ### Nhiều API key
 
@@ -42,9 +42,10 @@ Trong **Download** và **Library**, bấm ô tích trên từng thẻ hoặc bi�
 
 ## Ghi chú
 
-- **Script**: bấm **Import Excel** và chọn file `.xlsx` có sheet `Footage Tracker`, với cột `Scene ID` và `Voice-over (original)`. Bảng hiển thị ô chọn, STT, Thumbnail video, rồi toàn bộ cột gốc. Dùng cuộn ngang để xem các cột và nút trang trước/sau để xem từng 20 cảnh. Tích chọn từng dòng hoặc **Select all** để chọn toàn bộ dòng trên mọi trang; lựa chọn được giữ khi chuyển trang. **Download** tìm bằng `Primary search keyword`, tải một video Pixabay mới cho mỗi dòng, lưu vào Library, cập nhật `Status`, `Selected clip URL / file` và thumbnail nếu tạo được. Dòng đã có file được bỏ qua; dòng lỗi có thể chọn tải lại. Cần API key trong Setup; bấm **Hủy tải** để dừng các dòng chưa hoàn tất. **Xóa line** cần xác nhận, chỉ xóa dòng Script, giữ video trong Library và file Excel gốc. Dữ liệu lưu tại `data/script.json`, được nạp lại khi mở Script. Import thành công sẽ thay bảng hiện tại; hủy hoặc import lỗi giữ dữ liệu cũ. Chưa hỗ trợ chỉnh sửa ô; các sheet Overview và Instructions không được import.
+- **Script**: bấm **Import Excel** và chọn file `.xlsx` có sheet `Footage Tracker` (cột `Scene ID`, `Voice-over (original)`) hoặc `Visual Beat Tracker` (cột `Beat ID`, `Voice-over Beat`, `Primary Stock Keyword`). Có thể dùng mẫu Alaska tại `data/Alaska_Visual_Beat_Tracker_with_Pixabay_Links.xlsx`; các trường nguồn được giữ lại, đồng thời ánh xạ Beat ID, narration, keyword, alternative keywords, shot type và Footage URL vào các trường Script tương ứng. Bảng hiển thị ô chọn, STT, Thumbnail video, rồi toàn bộ cột gốc. Dùng cuộn ngang để xem các cột và nút trang trước/sau để xem từng 20 cảnh. Tích chọn từng dòng hoặc **Select all** để chọn toàn bộ dòng trên mọi trang; lựa chọn được giữ khi chuyển trang. **Download** tìm bằng `Primary search keyword`, tải một video Pixabay mới cho mỗi dòng, lưu vào Library, cập nhật `Status`, `Selected clip URL / file` và thumbnail nếu tạo được. Dòng đã có file được bỏ qua; dòng lỗi có thể chọn tải lại. Cần API key trong Setup; bấm **Hủy tải** để dừng các dòng chưa hoàn tất. **Xóa line** cần xác nhận, chỉ xóa dòng Script, giữ video trong Library và file Excel gốc. Dữ liệu lưu tại `data/script.json`, được nạp lại khi mở Script. Import thành công sẽ thay bảng hiện tại; hủy hoặc import lỗi giữ dữ liệu cũ. Chưa hỗ trợ chỉnh sửa ô; các sheet Overview và Instructions không được import.
 
 - Trong Download, Library và Script có chung thiết lập tải video: chất lượng HD/2K/4K (mặc định 2K) và hướng ngang/dọc (mặc định ngang). Stock chọn rendition Pixabay gần mức yêu cầu nhất; nếu mức đó không có, dùng rendition khả dụng gần nhất. Pixabay không cung cấp rendition 2K riêng, nên mức 2K có thể dùng file 4K hoặc 1080p tùy video.
 - Mỗi thẻ có liên kết về trang Pixabay và tên tác giả để ghi nhận nguồn.
 - Mỗi trang kết quả được cache cục bộ 24 giờ theo keyword để tuân thủ giới hạn API Pixabay. Nếu Pixabay trả HTTP 429, ứng dụng hiển thị thời gian chờ.
 - Tuân thủ điều khoản Pixabay; tránh dùng cho tải hàng loạt có hệ thống.
+

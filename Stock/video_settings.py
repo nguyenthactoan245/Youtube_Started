@@ -4,7 +4,7 @@ from __future__ import annotations
 import flet as ft
 
 
-def build_video_settings(preferences: dict[str, str]) -> ft.Row:
+def build_video_settings(preferences: dict[str, str], include_source: bool = False) -> ft.Row:
     quality = ft.Dropdown(
         label="Chất lượng",
         value=preferences.get("quality", "2K"),
@@ -29,9 +29,21 @@ def build_video_settings(preferences: dict[str, str]) -> ft.Row:
 
     quality.on_change = update_quality
     orientation.on_change = update_orientation
-    return ft.Row(
-        controls=[ft.Text("Thiết lập tải video", color=ft.Colors.BLUE_GREY_300), quality, orientation],
-        spacing=12,
-        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        wrap=True,
-    )
+    controls = [ft.Text("Thiết lập tải video", color=ft.Colors.BLUE_GREY_300), quality, orientation]
+    source = None
+    source = None
+    if include_source:
+        source = ft.Dropdown(
+            label="Nguồn",
+            value=preferences.get("source", "pixabay"),
+            width=160,
+            options=[ft.DropdownOption(key="pixabay", text="Pixabay"),
+                     ft.DropdownOption(key="pexels", text="Pexels")],
+        )
+        source.on_change = lambda event: preferences.__setitem__(
+            "source", event.control.value or "pixabay")
+        controls.append(source)
+    row = ft.Row(controls=controls, spacing=12,
+                 vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True)
+    row.source_dropdown = source
+    return row

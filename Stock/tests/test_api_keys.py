@@ -301,6 +301,14 @@ class ApiKeyTests(unittest.TestCase):
                 asyncio.run(settings.save(None))
             self.assertNotIn('private path', settings.status.value)
 
+    def test_settings_save_pexels_key(self):
+        with patch("api_key_settings.save_pexels_api_key", return_value="pexels-test-key") as save:
+            settings = ApiKeySettings(SimpleNamespace(update=lambda: None), Path("unused"))
+            settings.pexels_field.value = "pexels-test-key"
+            asyncio.run(settings.save_pexels(None))
+            save.assert_called_once_with("pexels-test-key", Path("unused"))
+            self.assertIn("Đã lưu", settings.pexels_status.value)
+
     def test_shared_pool_and_save_during_inflight_request(self):
         with patch.dict(os.environ, {'PIXABAY_API_KEYS': 'alpha,beta'}, clear=True):
             pool = get_api_key_pool()

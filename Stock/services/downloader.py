@@ -20,27 +20,35 @@ def safe_folder_name(value: str) -> str:
     return cleaned[:80] or "untitled"
 
 
+def footage_filename(video: Video, name_prefix: str = "") -> str:
+    """Build a safe footage filename, optionally prefixing its Visual Beat label."""
+    prefix = safe_folder_name(name_prefix) if name_prefix.strip() else (
+        f"{video.source}_{video.id}" if video.source != "pixabay" else str(video.id))
+    return f"{prefix}_{video.width}x{video.height}.mp4"
+
+
 def _download_one(video: Video, destination: Path, cancel: Event, report: ProgressCallback,
-                  database: VideoDatabase | None = None, owner: str | None = None) -> None:
-    target = destination / f"{video.id}_{video.width}x{video.height}.mp4"
+                  database: VideoDatabase | None = None, owner: str | None = None,
+                  name_prefix: str = "") -> None:
+    target = destination / footage_filename(video, name_prefix)
     temporary = target.with_suffix(".mp4.part")
     if target.exists() and target.stat().st_size > 0:
         _download_thumbnail(video, target)
         if database and owner:
-            database.record(video.id, owner, "completed")
+            database.record(video.id, owner, "completed", source=video.source)
         report(DownloadEvent(video.id, "done", 1, "Đã có sẵn"))
         return
 
     if cancel.is_set():
         if database and owner:
-            database.record(video.id, owner, "cancelled")
+            database.record(video.id, owner, "cancelled", source=video.source)
         report(DownloadEvent(video.id, "cancelled", 0, "Đã hủy"))
         return
 
     report(DownloadEvent(video.id, "downloading", 0, "Đang tải"))
     try:
         if database and owner:
-            database.record(video.id, owner, "downloading")
+            database.record(video.id, owner, "downloading", source=video.source)
         request = Request(video.url, headers={"User-Agent": "StockDownloader/1.0"})
         with urlopen(request, timeout=60) as response, temporary.open("wb") as output:
             total = int(response.headers.get("Content-Length", video.size) or 0)
@@ -53,17 +61,17 @@ def _download_one(video: Video, destination: Path, cancel: Event, report: Progre
                 report(DownloadEvent(video.id, "downloading", received / total if total else 0, "Đang tải"))
         if cancel.is_set():
             raise InterruptedError
-        if database and owner and not database.owns(video.id, owner):
+        if database and owner and not database.owns(video.id, owner, source=video.source):
             raise InterruptedError
         temporary.replace(target)
         _download_thumbnail(video, target)
         if database and owner:
-            database.record(video.id, owner, "completed")
+            database.record(video.id, owner, "completed", source=video.source)
         report(DownloadEvent(video.id, "done", 1, f"Đã lưu: {target.name}"))
     except InterruptedError:
         temporary.unlink(missing_ok=True)
         if database and owner:
-            database.record(video.id, owner, "cancelled")
+            database.record(video.id, owner, "cancelled", source=video.source)
         report(DownloadEvent(video.id, "cancelled", 0, "Đã hủy"))
     except Exception as exc:
         if isinstance(exc, HTTPError):
@@ -72,7 +80,7 @@ def _download_one(video: Video, destination: Path, cancel: Event, report: Progre
             record(stage='download_mp4', video_id=video.id, kind='download_error', error_type=type(exc).__name__)
         temporary.unlink(missing_ok=True)
         if database and owner:
-            database.record(video.id, owner, "failed", str(exc))
+            database.record(video.id, owner, "failed", str(exc), source=video.source)
         report(DownloadEvent(video.id, "error", 0, f"Lỗi tải: {exc}"))
 
 
@@ -95,12 +103,14 @@ def _download_thumbnail(video: Video, video_path: Path) -> None:
 
 
 def download_many(videos: list[Video], root: Path, keyword: str, cancel: Event, report: ProgressCallback,
-                  database: VideoDatabase | None = None, owner: str | None = None) -> Path:
+                  database: VideoDatabase | None = None, owner: str | None = None,
+                  name_prefix: str = "") -> Path:
     """Download at most three videos concurrently; completed files are never overwritten."""
     destination = root / safe_folder_name(keyword)
     destination.mkdir(parents=True, exist_ok=True)
     with ThreadPoolExecutor(max_workers=min(3, max(1, len(videos)))) as executor:
-        futures = [executor.submit(_download_one, video, destination, cancel, report, database, owner) for video in videos]
+        futures = [executor.submit(_download_one, video, destination, cancel, report, database, owner,
+                                  name_prefix) for video in videos]
         for future in as_completed(futures):
             future.result()
     return destination

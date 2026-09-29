@@ -15,6 +15,7 @@ class Video:
     width: int
     height: int
     size: int
+    source: str = "pixabay"
 
 
 @dataclass(frozen=True)

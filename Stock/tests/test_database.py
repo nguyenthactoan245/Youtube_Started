@@ -100,6 +100,21 @@ class DatabaseTests(unittest.TestCase):
             for owner in owners:
                 self.db.finish_batch(owner)
 
+    def test_pexels_and_pixabay_can_share_video_id_and_download_is_source_scoped(self):
+        pexels_video = Video(7, "Alaska glacier", 8, "Creator", "https://www.pexels.com/video/7/",
+                             "https://example.com/pexels.mp4", "", 1280, 720, 5, source="pexels")
+        with self.db.batch() as owner:
+            self.assertTrue(self.db.reserve(video(7), "Alaska", self.library / "7.mp4", owner))
+            self.assertTrue(self.db.reserve(pexels_video, "Alaska", self.library / "pexels_7.mp4", owner))
+            with patch("services.downloader.urlopen", side_effect=lambda *args, **kwargs: Response()):
+                download_many([pexels_video], self.library, "Alaska", Event(), lambda _: None,
+                              self.db, owner)
+        self.assertTrue((self.library / "Alaska" / "pexels_7_1280x720.mp4").is_file())
+        with self.db.connect() as connection:
+            sources = {row["source"] for row in connection.execute(
+                "SELECT source FROM videos WHERE video_id=7").fetchall()}
+        self.assertEqual(sources, {"pixabay", "pexels"})
+
     def test_import_preserves_legacy_files_and_unknown_names(self):
         old = self.root / 'downloads' / 'Moscow'
         old.mkdir(parents=True)

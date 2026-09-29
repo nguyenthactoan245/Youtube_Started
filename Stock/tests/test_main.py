@@ -52,6 +52,9 @@ class EnvironmentTests(unittest.TestCase):
         self.assertTrue(callable(sidebar_buttons[4].on_click))
         panels = root_row.controls[2].content.controls
         download_view = panels[1].content
+        source_dropdown = download_view.controls[3].controls[-1]
+        self.assertEqual(source_dropdown.label, "Nguồn")
+        self.assertEqual([option.key for option in source_dropdown.options], ["pixabay", "pexels"])
         download_layout_buttons = download_view.controls[0].controls[1].controls
         download_layout_buttons[1].on_click(None)
         self.assertIsInstance(download_view.controls[-1].content, main.ft.ListView)
@@ -74,6 +77,13 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(panels[3].content.controls[0].width, 260)
         asyncio.run(sidebar_buttons[5].on_click(None))
         self.assertTrue(panels[4].visible)
+        setup_view = panels[4].content
+        self.assertEqual(setup_view.scroll, main.ft.ScrollMode.AUTO)
+        api_settings = setup_view.controls[2]
+        self.assertEqual(api_settings.pexels_field.label, "Pexels API key")
+        self.assertTrue(api_settings.pexels_field.password)
+        self.assertEqual(api_settings.pexels_field.height, 56)
+        self.assertEqual(api_settings.pexels_field.width, 640)
 
     def test_library_switch_is_cached_and_loading_is_visible(self) -> None:
         class TestPage:

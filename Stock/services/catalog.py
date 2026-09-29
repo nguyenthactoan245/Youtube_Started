@@ -6,7 +6,7 @@ from threading import Event
 
 from models import Video
 from services.database import VideoDatabase
-from services.downloader import safe_folder_name
+from services.downloader import footage_filename, safe_folder_name
 from services.pixabay import search_page
 from services.api_keys import ApiKeyPool
 
@@ -14,7 +14,7 @@ from services.api_keys import ApiKeyPool
 def select_unique(api_key: str, keyword: str, amount: int, root: Path,
                   database: VideoDatabase, owner: str, cancel: Event,
                   exclude_ids: set[int] | None = None, quality: str = "2K",
-                  orientation: str = "landscape") -> list[Video]:
+                  orientation: str = "landscape", filename_prefix: str = "") -> list[Video]:
     selected: list[Video] = []
     seen: set[int] = set(exclude_ids or ())
     page = 1
@@ -33,8 +33,8 @@ def select_unique(api_key: str, keyword: str, amount: int, root: Path,
             if video.id in seen:
                 continue
             seen.add(video.id)
-            target = root / safe_folder_name(keyword) / f"{video.id}_{video.width}x{video.height}.mp4"
-            if database.reserve(video, keyword, target, owner):
+            target = root / safe_folder_name(keyword) / footage_filename(video)
+            if database.reserve(video, keyword, target, owner, filename_prefix):
                 selected.append(video)
         if not videos or page * 200 >= total:
             break
