@@ -13,11 +13,13 @@ from pathlib import Path
 from threading import Event
 import shutil
 import subprocess
+import time
 
 import flet as ft
 
 from services.scripts import load_tracker, read_tracker, save_tracker
-from services.script_downloads import download_scene, video_id_from_clip
+from services.script_downloads import (download_pexels_link, download_scene,
+                                       download_scene_direct_pexels, video_id_from_clip)
 from services.video_trim import trim_video
 from services.assets import export_videos_zip
 from services.pixabay import PixabayRateLimitError, PixabayAccessPause
@@ -61,6 +63,8 @@ COLUMN_WIDTHS = {
     "Notes": 260,
 }
 
+HIDDEN_SCRIPT_COLUMNS = {"Visual Direction", "Pixabay Search"}
+
 
 class ScriptView:
     def __init__(self, page, picker: ft.FilePicker, target: Path, database=None, library_root=None,
@@ -85,14 +89,30 @@ class ScriptView:
         self.open_preview = open_preview
         self.video_preferences = video_preferences if video_preferences is not None else {
             "quality": "2K", "orientation": "landscape"}
-        self.video_settings = build_video_settings(self.video_preferences, include_source=True)
+        # Keep Script choices independent from the Download page while using
+        # them for every Crawl action started in this view.
+        self.video_settings_preferences = {
+            "quality": self.video_preferences.get("quality", "2K"),
+            "orientation": self.video_preferences.get("orientation", "landscape"),
+            "source": self.video_preferences.get("source", "pixabay"),
+            "method": self.video_preferences.get("method", "api"),
+            "workers": str(self.video_preferences.get("workers", self.download_workers)),
+        }
+        self.video_settings = build_video_settings(
+            self.video_settings_preferences, include_source=True, include_method=True,
+            include_workers=True)
         self.video_tiles = {}
         self.progress = ft.ProgressBar(value=0, color=ft.Colors.CYAN_300)
         self.progress_label = ft.Text(size=12)
+        self.elapsed_label = ft.Text("Thời gian: 00:00:00", size=12,
+                                    color=ft.Colors.BLUE_GREY_300)
+        self.operation_started_at = None
         self.file_progress = ft.ProgressBar(value=None, color=ft.Colors.BLUE_300)
         self.file_label = ft.Text(size=12)
         self.progress_panel = ft.Column(visible=False, spacing=4, controls=[
-            self.progress_label, self.progress, self.file_label, self.file_progress])
+            ft.Row([self.progress_label, self.elapsed_label],
+                   alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            self.progress, self.file_label, self.file_progress])
         self.trim_progress_label = ft.Text(size=12)
         self.trim_progress = ft.ProgressBar(value=0, color=ft.Colors.AMBER_300)
         self.trim_activity = ft.ProgressBar(value=None, color=ft.Colors.AMBER_300)
@@ -130,6 +150,14 @@ class ScriptView:
             tooltip="Trim video đã chọn", on_click=self.trim_selected_videos)
         self.crawl_button = ft.FilledButton("Crawl", icon=ft.Icons.DOWNLOAD,
                                             on_click=self.download_selected)
+        self.pexels_link = ft.TextField(
+            label="Link video Pexels",
+            hint_text="https://www.pexels.com/video/ten-video-123456/",
+            expand=True,
+            on_change=self.update_pexels_link_action,
+        )
+        self.pexels_link_button = ft.OutlinedButton(
+            "Crawl link", icon=ft.Icons.LINK, on_click=self.crawl_pexels_link, disabled=True)
         self.cancel_button = ft.IconButton(icon=ft.Icons.CANCEL_OUTLINED, tooltip="Hủy tải",
                                            visible=False, on_click=self.cancel_download)
         self.resume_search = ft.TextButton("Tiếp tục tìm kiếm", visible=False,
@@ -153,6 +181,8 @@ class ScriptView:
             ft.Row([self.video_settings, self.crawl_button, self.cancel_button,
                     self.resume_search], spacing=8, wrap=True,
                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            ft.Row([self.pexels_link, self.pexels_link_button], spacing=8,
+                   vertical_alignment=ft.CrossAxisAlignment.END),
             ft.Row([self.select_all, self.select_all_trimmed, self.export_selected_button,
                     self.trim_button, self.delete_button, self.edit_script_button,
                     self.save_script_edits_button, self.cancel_script_edits_button,
@@ -389,6 +419,9 @@ class ScriptView:
         self.trim_button.disabled = self.busy or self.edit_mode or not self.selected
         self.delete_button.disabled = self.busy or self.edit_mode or not self.selected
         self.crawl_button.disabled = self.busy or self.edit_mode or not self.selected or self.database is None
+        self.pexels_link_button.disabled = (self.busy or self.edit_mode or len(self.selected) != 1
+                                            or self.database is None
+                                            or not (self.pexels_link.value or "").strip())
         self.import_button.disabled = self.busy or self.edit_mode
         self.edit_script_button.disabled = self.busy or self.edit_mode or not self.data
         self.save_script_edits_button.disabled = self.busy
@@ -670,6 +703,79 @@ class ScriptView:
         self.message.value = "Đang hủy tải..."
         self.page.update()
 
+    def update_pexels_link_action(self, _=None):
+        self.pexels_link_button.disabled = (
+            self.busy or self.edit_mode or len(self.selected) != 1
+            or self.database is None or not (self.pexels_link.value or "").strip())
+        self.page.update()
+
+    async def crawl_pexels_link(self, _):
+        if self.busy or len(self.selected) != 1 or not self.data or self.database is None:
+            return
+        url = (self.pexels_link.value or "").strip()
+        if not url:
+            return
+
+        self.ensure_trim_column()
+        index = next(iter(self.selected))
+        self.busy = True
+        self.cancel = Event()
+        self.cancel_button.visible = True
+        self.cancel_button.disabled = False
+        self.progress_panel.visible = True
+        self.operation_started_at = time.monotonic()
+        self.update_elapsed()
+        self.file_progress.visible = True
+        self.file_progress.value = None
+        self.progress.value = None
+        self.progress_label.value = "Đang xử lý 1 dòng đã chọn"
+        self.file_label.value = "Đang lấy và tải video từ link Pexels..."
+        self.refresh_controls()
+        self.page.update()
+        try:
+            worker = asyncio.create_task(asyncio.to_thread(
+                download_pexels_link, url, self.library_root, self.database, self.cancel,
+                None, self.video_settings_preferences.get("orientation", "all")))
+            while not worker.done():
+                await asyncio.wait({worker}, timeout=0.25)
+                self.update_elapsed()
+                self.page.update()
+            path = await worker
+            headers = list(self.data["headers"])
+            rows = [list(row) for row in self.data["rows"]]
+            for name in ("Status", "Selected clip URL / file", "File Name"):
+                if name not in headers:
+                    headers.append(name)
+                    for row in rows:
+                        row.append("")
+            row = rows[index]
+            row[headers.index("Selected clip URL / file")] = path
+            row[headers.index("File Name")] = Path(path).name
+            row[headers.index("Status")] = "Downloaded"
+            await self.update_video_durations(row, headers, original_path=path)
+            self.posters[path] = await asyncio.to_thread(thumbnail_bytes, Path(path))
+            updated = {**self.data, "headers": headers, "rows": rows}
+            self.mark_duration_errors(updated)
+            await asyncio.to_thread(save_tracker, updated, self.target)
+            self.data = updated
+            self.progress.value = 1
+            self.progress_label.value = "Đã xử lý 1/1 dòng · 100%"
+            self.file_label.value = "Video Pexels đã được cập nhật vào dòng đã chọn."
+            self.message.value = f"Đã cập nhật video từ link Pexels vào dòng {index + 1}."
+            if self.on_download_complete:
+                self.on_download_complete()
+        except InterruptedError:
+            self.message.value = "Đã hủy tải video từ link Pexels."
+        except Exception as exc:
+            self.message.value = f"Không thể cập nhật link Pexels: {self.error_text(exc)}"
+        finally:
+            self.busy = False
+            self.update_elapsed()
+            self.cancel_button.visible = False
+            self.file_progress.visible = False
+            self.refresh_controls()
+            self.page.update()
+
     @staticmethod
     def error_text(exc):
         text = str(exc) or type(exc).__name__
@@ -691,14 +797,21 @@ class ScriptView:
         self.progress.value = processed / total if total else 0
         self.progress_label.value = f"Đã xử lý {processed}/{total} dòng · {self.progress.value:.0%}"
 
+    def update_elapsed(self):
+        elapsed = max(0, int(time.monotonic() - self.operation_started_at)) \
+            if self.operation_started_at is not None else 0
+        hours, remainder = divmod(elapsed, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        self.elapsed_label.value = f"Thời gian: {hours:02d}:{minutes:02d}:{seconds:02d}"
+
     async def download_with_progress(self, keyword, api_key, previous_clip="", beat_id="", visual_direction="",
                                     exclude_ids=None):
         updates = deque(maxlen=1)
         worker = asyncio.create_task(asyncio.to_thread(
             download_scene, keyword, api_key, self.library_root, self.database, self.cancel,
-            updates.append, previous_clip, self.video_preferences["quality"],
-            self.video_preferences["orientation"], beat_id, visual_direction,
-            self.video_preferences.get("source", "pixabay"), exclude_ids))
+            updates.append, previous_clip, self.video_settings_preferences["quality"],
+            self.video_settings_preferences["orientation"], beat_id, visual_direction,
+            self.video_settings_preferences.get("source", "pixabay"), exclude_ids))
         while not worker.done():
             await asyncio.wait({worker}, timeout=0.1)
             if not updates and isinstance(api_key, ApiKeyPool):
@@ -753,17 +866,22 @@ class ScriptView:
     async def download_selected(self, _):
         if self.busy or not self.selected or not self.data or self.database is None:
             return
-        if "Primary search keyword" not in self.data["headers"]:
+        if not any(name in self.data["headers"] for name in
+                   ("Primary search keyword", "Primary Stock Keyword")):
             self.message.value = "Script thiếu cột từ khóa tìm kiếm."
             self.page.update()
             return
         self.ensure_trim_column()
-        source_dropdown = getattr(self.video_settings, "source_dropdown", None)
-        source = ((source_dropdown.value if source_dropdown else None)
-                  or self.video_preferences.get("source", "pixabay")).lower()
-        self.video_preferences["source"] = source
-        api_key = (configured_pexels_api_key() if source == "pexels" else get_api_key_pool())
-        if not api_key:
+        preferences = self.video_settings_preferences
+        source = preferences.get("source", "pixabay").lower()
+        method = preferences.get("method", "api").lower()
+        if method == "direct" and source != "pexels":
+            self.message.value = "Crawl trực tiếp chỉ hỗ trợ Pexels. Hãy chọn Pexels hoặc Crawl by API."
+            self.page.update()
+            return
+        api_key = None if method == "direct" else (
+            configured_pexels_api_key() if source == "pexels" else get_api_key_pool())
+        if method == "api" and not api_key:
             provider = "Pexels" if source == "pexels" else "Pixabay"
             self.message.value = f"Hãy nhập {provider} API key trong Setup trước khi tải."
             self.page.update()
@@ -776,9 +894,22 @@ class ScriptView:
         completed = failed = 0
         processed = 0
         self.progress_panel.visible = True
+        self.operation_started_at = time.monotonic()
+        self.update_elapsed()
         self.file_progress.visible = True
         self.file_progress.value = None
-        self.file_label.value = f"Đang chuẩn bị tối đa {self.download_workers} luồng tải..."
+        worker_dropdown = getattr(self.video_settings, "workers_dropdown", None)
+        selected_workers = (worker_dropdown.value if worker_dropdown is not None
+                            else preferences.get("workers", self.download_workers))
+        try:
+            worker_count = min(20, max(1, int(selected_workers)))
+        except (TypeError, ValueError):
+            worker_count = self.download_workers
+        preferences["workers"] = str(worker_count)
+        self.file_label.value = (
+            f"Đang chuẩn bị tối đa {worker_count} luồng crawl trực tiếp từ Pexels..."
+            if method == "direct"
+            else f"Đang chuẩn bị tối đa {worker_count} luồng tải...")
         self.update_progress(0, len(selected))
         self.render()
         self.page.update()
@@ -802,19 +933,25 @@ class ScriptView:
 
             def start_scene(index):
                 row = rows[index]
+                if method == "direct":
+                    return loop.run_in_executor(
+                        executor, download_scene_direct_pexels,
+                        row[headers.index(keyword_header)], self.library_root,
+                        self.database, self.cancel, None,
+                        preferences["orientation"], script_excluded_ids)
                 return loop.run_in_executor(
                     executor, download_scene,
                     row[headers.index(keyword_header)], api_key, self.library_root,
                     self.database, self.cancel, None, row[clip_column],
-                    self.video_preferences["quality"], self.video_preferences["orientation"],
+                    preferences["quality"], preferences["orientation"],
                     row[headers.index("Beat ID")] if "Beat ID" in headers else "",
                     row[headers.index("Visual Direction")] if "Visual Direction" in headers else "",
                     source, script_excluded_ids)
 
-            executor = ThreadPoolExecutor(max_workers=self.download_workers,
+            executor = ThreadPoolExecutor(max_workers=worker_count,
                                           thread_name_prefix="script-download")
             next_position = 0
-            while next_position < len(selected) and len(tasks) < self.download_workers:
+            while next_position < len(selected) and len(tasks) < worker_count:
                 index = selected[next_position]
                 if self.cancel.is_set():
                     break
@@ -823,7 +960,12 @@ class ScriptView:
             rate_limited = False
             finished_indices = set()
             while tasks:
-                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    tasks, timeout=0.25, return_when=asyncio.FIRST_COMPLETED)
+                self.update_elapsed()
+                self.page.update()
+                if not done:
+                    continue
                 for task in done:
                     index = tasks.pop(task)
                     finished_indices.add(index)
@@ -891,7 +1033,7 @@ class ScriptView:
                     if rate_limited:
                         self.cancel.set()
                 if not self.cancel.is_set():
-                    while next_position < len(selected) and len(tasks) < self.download_workers:
+                    while next_position < len(selected) and len(tasks) < worker_count:
                         index = selected[next_position]
                         tasks[start_scene(index)] = index
                         next_position += 1
@@ -905,6 +1047,7 @@ class ScriptView:
         finally:
             executor.shutdown(wait=False, cancel_futures=True) if "executor" in locals() else None
             self.busy = False
+            self.update_elapsed()
             self.cancel_button.visible = False
             self.file_progress.visible = False
             self.file_label.value = "Đã hủy lượt tải." if self.cancel.is_set() else "Lượt tải đã kết thúc."
@@ -1132,10 +1275,10 @@ class ScriptView:
             return
         self.message.value = f'{self.data["filename"]} • {len(self.data["rows"])} cảnh'
         tracker_headers = list(self.data["headers"])
-        trim_index = tracker_headers.index("Trimed video") if "Trimed video" in tracker_headers else None
-        display_headers = tracker_headers.copy()
-        if trim_index is not None:
-            display_headers.insert(0, display_headers.pop(trim_index))
+        display_headers = [header for header in tracker_headers
+                           if header not in HIDDEN_SCRIPT_COLUMNS]
+        if "Trimed video" in display_headers:
+            display_headers.insert(0, display_headers.pop(display_headers.index("Trimed video")))
         for duration_header in ("Thumbnail Video Duration", "Trimed video Duration"):
             if duration_header in display_headers:
                 display_headers.remove(duration_header)
@@ -1143,6 +1286,12 @@ class ScriptView:
         display_headers[insert_at:insert_at] = [
             name for name in ("Thumbnail Video Duration", "Trimed video Duration")
             if name in tracker_headers]
+        keyword_header = next((name for name in ("Primary Stock Keyword",
+                                                  "Primary search keyword")
+                               if name in display_headers), None)
+        if keyword_header and "Beat ID" in display_headers:
+            display_headers.remove(keyword_header)
+            display_headers.insert(display_headers.index("Beat ID") + 1, keyword_header)
         headers = ["STT", "Thumbnail video", *display_headers]
         widths = [52, 180, *[COLUMN_WIDTHS.get(h.strip(), 160) for h in display_headers]]
         self.table.width = sum(widths)

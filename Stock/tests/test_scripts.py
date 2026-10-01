@@ -23,7 +23,8 @@ from services.pixabay import PixabayRateLimitError, rate_limit_delay, _fetch_pay
 from urllib.error import HTTPError
 from models import Video
 from services.database import VideoDatabase
-from services.script_downloads import download_scene
+from services.script_downloads import (download_pexels_link, download_scene,
+                                       download_scene_direct_pexels)
 from services.video_trim import trim_video
 
 
@@ -48,13 +49,97 @@ def make_workbook(path):
 
 
 class ScriptTests(unittest.TestCase):
+    def test_script_table_hides_visual_direction_and_pixabay_search_columns(self):
+        view = ScriptView(SimpleNamespace(update=lambda: None), None, Path("unused"))
+        view.data = {
+            "filename": "test.xlsx",
+            "headers": ["Scene ID", "Visual Direction", "Pixabay Search", "Status",
+                        "Primary Stock Keyword", "Beat ID", "Trimed video"],
+            "rows": [["1", "Wide establishing shot", "https://pixabay.test/search", "",
+                      "Amazon rainforest", "VB-001", ""]],
+        }
+        view.render()
+
+        header_row = view.table.controls[0].content
+        labels = [container.content.value for container in header_row.controls]
+        self.assertIn("Scene ID", labels)
+        self.assertIn("Status", labels)
+        self.assertNotIn("Visual Direction", labels)
+        self.assertNotIn("Pixabay Search", labels)
+        self.assertEqual(labels[2], "Trimed video")
+        self.assertEqual(labels.index("Primary Stock Keyword"), labels.index("Beat ID") + 1)
+        self.assertEqual(view.data["rows"][0][1], "Wide establishing shot")
+        self.assertEqual(view.data["rows"][0][2], "https://pixabay.test/search")
+
     def test_script_video_settings_include_pixabay_and_pexels_sources(self):
+        operational_preferences = {"quality": "2K", "orientation": "landscape",
+                                    "source": "pexels"}
         view = ScriptView(SimpleNamespace(update=lambda: None), None, Path("unused"),
-                          video_preferences={"quality": "2K", "orientation": "landscape",
-                                             "source": "pexels"})
+                          video_preferences=operational_preferences)
         dropdown = view.video_settings.source_dropdown
         self.assertEqual(dropdown.value, "pexels")
         self.assertEqual([option.key for option in dropdown.options], ["pixabay", "pexels"])
+        self.assertEqual([option.key for option in view.video_settings.controls[1].options],
+                         ["All", "HD", "2K", "4K"])
+        self.assertEqual([option.key for option in view.video_settings.controls[2].options],
+                         ["all", "landscape", "portrait"])
+        self.assertEqual([option.key for option in view.video_settings.method_dropdown.options],
+                         ["api", "direct"])
+        workers = view.video_settings.workers_dropdown
+        self.assertEqual(workers.value, "5")
+        self.assertEqual([option.key for option in workers.options],
+                         [str(value) for value in range(1, 21)])
+        workers.value = "20"
+        workers.on_change(SimpleNamespace(control=workers))
+        self.assertEqual(view.video_settings_preferences["workers"], "20")
+        dropdown.value = "pixabay"
+        dropdown.on_change(SimpleNamespace(control=dropdown))
+        self.assertEqual(view.video_settings_preferences["source"], "pixabay")
+        self.assertEqual(operational_preferences["source"], "pexels")
+
+    def test_direct_pexels_download_uses_browser_search_without_api_key(self):
+        video = Video(321, "Utah", 8, "Author", "https://www.pexels.com/video/utah-321/",
+                      "https://example.test/video.mp4", "", 1920, 1080, 100, "pexels")
+        with temporary_directory() as directory:
+            database = VideoDatabase(directory / "library.db")
+            target = directory / "library" / "Utah" / "pexels_321_1920x1080.mp4"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"video")
+
+            def search(_keyword, _count, _cancel, **kwargs):
+                kwargs["on_batch"]([video])
+                return []
+
+            with patch("services.script_downloads.search_pexels_videos_direct",
+                       side_effect=search) as browser_search, \
+                 patch("services.script_downloads.download_matching_pexels_videos",
+                       return_value=([video], 1, 0, 0)) as download:
+                result = download_scene_direct_pexels(
+                    "Utah", directory / "library", database, Event(), orientation="landscape")
+
+            self.assertEqual(Path(result), target.resolve())
+            browser_search.assert_called_once()
+            self.assertEqual(download.call_args.args[4], "landscape")
+
+    def test_pexels_link_download_resolves_exact_video(self):
+        video = Video(654, "Alaska", 9, "Author", "https://www.pexels.com/video/alaska-654/",
+                      "https://example.test/video.mp4", "", 1920, 1080, 100, "pexels")
+        with temporary_directory() as directory:
+            database = VideoDatabase(directory / "library.db")
+            target = directory / "library" / "Alaska" / "pexels_654_1920x1080.mp4"
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"video")
+            with patch("services.script_downloads.resolve_pexels_video",
+                       return_value=video) as resolve, \
+                 patch("services.script_downloads.download_matching_pexels_videos",
+                       return_value=([video], 1, 0, 0)) as download:
+                result = download_pexels_link(
+                    video.page_url, directory / "library", database, Event(),
+                    orientation="landscape")
+
+            self.assertEqual(Path(result), target.resolve())
+            resolve.assert_called_once_with(video.page_url)
+            self.assertEqual(download.call_args.args[4], "landscape")
 
     def test_import_rounds_duration_to_one_decimal_place(self):
         with temporary_directory() as directory:
@@ -659,6 +744,39 @@ class ScriptTests(unittest.TestCase):
                              [str(directory / f"keyword-{i}.mp4") for i in range(7)])
             self.assertEqual(view.progress.value, 1)
             self.assertEqual(max_active, 5)
+
+    def test_direct_pexels_crawl_uses_worker_count_currently_shown_in_dropdown(self):
+        with temporary_directory() as directory:
+            view = ScriptView(SimpleNamespace(update=lambda: None), None,
+                              directory / "script.json", object(), directory)
+            view.video_settings_preferences.update({"method": "direct", "source": "pexels"})
+            # Reproduce clicking Crawl before Flet dispatches the dropdown on_change event.
+            view.video_settings.workers_dropdown.value = "10"
+            view.data = {"filename": "test.xlsx", "headers": ["Scene ID", "Primary search keyword"],
+                         "rows": [[str(i), f"keyword-{i}"] for i in range(12)]}
+            view.selected = set(range(12))
+            active = 0
+            max_active = 0
+            lock = Lock()
+
+            def download(keyword, *args):
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.03)
+                with lock:
+                    active -= 1
+                return str(directory / f"{keyword}.mp4")
+
+            with patch("script_view.download_scene_direct_pexels", side_effect=download) as direct, \
+                 patch("script_view.download_scene") as api_download, \
+                 patch("script_view.thumbnail_bytes", return_value=None):
+                asyncio.run(view.download_selected(None))
+
+            self.assertEqual(direct.call_count, 12)
+            api_download.assert_not_called()
+            self.assertEqual(max_active, 10)
 
     def test_cancel_stops_before_next_row(self):
         with temporary_directory() as directory:
