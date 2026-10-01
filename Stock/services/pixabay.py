@@ -146,12 +146,14 @@ def _fetch_payload(api_key: str, keyword: str, page: int = 1, on_headers=None) -
 
 
 def _choose_rendition(renditions: dict[str, Any], quality: str) -> dict[str, Any] | None:
-    target = QUALITY_TARGETS.get(quality, QUALITY_TARGETS["2K"])
     available = [item for item in renditions.values()
                  if item and item.get("url") and int(item.get("width", 0)) > 0
                  and int(item.get("height", 0)) > 0]
     if not available:
         return None
+    if quality == "All":
+        return max(available, key=lambda item: int(item["width"]) * int(item["height"]))
+    target = QUALITY_TARGETS.get(quality, QUALITY_TARGETS["2K"])
     above_target = [item for item in available
                     if max(int(item["width"]), int(item["height"])) >= target]
     if above_target:
@@ -182,9 +184,9 @@ def search_page(api_key: str | ApiKeyPool, keyword: str, page: int = 1,
         if not rendition or not rendition.get("url"):
             continue
         width, height = int(rendition.get("width", 0)), int(rendition.get("height", 0))
-        if orientation == "landscape" and width < height:
+        if orientation == "landscape" and width <= height:
             continue
-        if orientation == "portrait" and height < width:
+        if orientation == "portrait" and height <= width:
             continue
         videos.append(
             Video(

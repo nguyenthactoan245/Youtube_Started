@@ -37,27 +37,33 @@ def configured_api_keys() -> list[str]:
 
 
 def configured_pexels_api_key() -> str:
-    return os.getenv("PEXELS_API_KEY", "").strip()
+    return next(iter(configured_pexels_api_keys()), "")
+
+
+def configured_pexels_api_keys() -> list[str]:
+    return parse_api_keys(os.getenv("PEXELS_API_KEYS", "").strip()
+                          or os.getenv("PEXELS_API_KEY", ""))
 
 
 def save_pexels_api_key(value: str, root: Path = DATA_ROOT) -> str:
-    value = value.strip()
-    if value and not re.fullmatch(r"[A-Za-z0-9_-]+", value):
-        raise ValueError("Pexels API key chỉ được chứa chữ, số, dấu gạch ngang và gạch dưới.")
+    keys = save_pexels_api_keys(value, root)
+    return keys[0] if keys else ""
+
+
+def save_pexels_api_keys(value: str, root: Path = DATA_ROOT) -> list[str]:
+    keys = parse_api_keys(value)
     root.mkdir(parents=True, exist_ok=True)
     target = root / ".env"
     lines = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
-    lines = [line for line in lines if line.split("=", 1)[0].strip() != "PEXELS_API_KEY"]
-    if value:
-        lines.append(f"PEXELS_API_KEY={value}")
+    lines = [line for line in lines if line.split("=", 1)[0].strip()
+             not in {"PEXELS_API_KEY", "PEXELS_API_KEYS"}]
+    lines.append("PEXELS_API_KEYS=" + ",".join(keys))
     temporary = target.with_suffix(".env.tmp")
     temporary.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
     temporary.replace(target)
-    if value:
-        os.environ["PEXELS_API_KEY"] = value
-    else:
-        os.environ.pop("PEXELS_API_KEY", None)
-    return value
+    os.environ["PEXELS_API_KEYS"] = ",".join(keys)
+    os.environ.pop("PEXELS_API_KEY", None)
+    return keys
 
 
 def save_api_keys(value: str, root: Path = DATA_ROOT) -> list[str]:

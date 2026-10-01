@@ -52,7 +52,8 @@ class EnvironmentTests(unittest.TestCase):
         self.assertTrue(callable(sidebar_buttons[4].on_click))
         panels = root_row.controls[2].content.controls
         download_view = panels[1].content
-        source_dropdown = download_view.controls[3].controls[-1]
+        settings = download_view.controls[2]
+        source_dropdown = settings.source_dropdown
         self.assertEqual(source_dropdown.label, "Nguồn")
         self.assertEqual([option.key for option in source_dropdown.options], ["pixabay", "pexels"])
         download_layout_buttons = download_view.controls[0].controls[1].controls
@@ -84,6 +85,65 @@ class EnvironmentTests(unittest.TestCase):
         self.assertTrue(api_settings.pexels_field.password)
         self.assertEqual(api_settings.pexels_field.height, 56)
         self.assertEqual(api_settings.pexels_field.width, 640)
+
+    def test_download_method_allows_pixabay_in_api_mode(self) -> None:
+        class TestPage:
+            window = SimpleNamespace()
+
+            def add(self, *controls: object) -> None:
+                self.controls = controls
+
+            def update(self) -> None:
+                pass
+
+        page = TestPage()
+        with patch.object(main, "load_library_entries", return_value=[]), \
+             patch.object(main, "load_dashboard_stats", return_value=(0, 0, 0)):
+            asyncio.run(main.main(page))
+
+        panels = page.controls[0].controls[2].content.controls
+        download_view = panels[1].content
+        settings = download_view.controls[2]
+        source = settings.source_dropdown
+        method = settings.method_dropdown
+        keyword_row, direct_row = download_view.controls[3:5]
+        api_start = keyword_row.controls[2]
+        direct_download = direct_row.controls[1]
+
+        self.assertEqual(method.value, "direct")
+        self.assertEqual(source.value, "pexels")
+        self.assertFalse(source.disabled)
+        self.assertTrue(keyword_row.visible)
+        self.assertTrue(direct_row.visible)
+        self.assertFalse(api_start.disabled)
+        self.assertFalse(direct_download.disabled)
+
+        with patch.object(source, "update", return_value=None):
+            method.value = "api"
+            method.on_change(SimpleNamespace(control=method))
+            self.assertFalse(source.disabled)
+            self.assertTrue(keyword_row.visible)
+            self.assertTrue(direct_row.visible)
+            self.assertFalse(api_start.disabled)
+            self.assertFalse(direct_download.disabled)
+
+        source.value = "pixabay"
+        source.on_change(SimpleNamespace(control=source))
+        self.assertEqual(source.value, "pixabay")
+
+        with patch.object(source, "update", return_value=None):
+            method.value = "direct"
+            method.on_change(SimpleNamespace(control=method))
+        self.assertFalse(source.disabled)
+        self.assertEqual(source.value, "pixabay")
+        self.assertTrue(keyword_row.visible)
+        self.assertTrue(direct_row.visible)
+        self.assertFalse(api_start.disabled)
+        self.assertTrue(direct_download.disabled)
+
+        source.value = "pexels"
+        source.on_change(SimpleNamespace(control=source))
+        self.assertFalse(direct_download.disabled)
 
     def test_library_switch_is_cached_and_loading_is_visible(self) -> None:
         class TestPage:

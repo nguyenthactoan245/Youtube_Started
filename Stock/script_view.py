@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import re
 import math
@@ -16,13 +17,13 @@ import subprocess
 import flet as ft
 
 from services.scripts import load_tracker, read_tracker, save_tracker
-from services.script_downloads import download_scene
+from services.script_downloads import download_scene, video_id_from_clip
 from services.video_trim import trim_video
 from services.assets import export_videos_zip
 from services.pixabay import PixabayRateLimitError, PixabayAccessPause
 from services.pexels import PexelsError
 from services.api_keys import ApiKeyPool, get_api_key_pool
-from app_config import configured_api_keys, configured_pexels_api_key
+from app_config import configured_api_keys, configured_pexels_api_key, configured_pexels_api_keys
 from services.thumbnails import thumbnail_bytes
 from script_video import ScriptVideo
 from video_settings import build_video_settings
@@ -79,6 +80,7 @@ class ScriptView:
         self.library_root = library_root
         self.on_download_complete = on_download_complete
         self.cancel = Event()
+        self.download_workers = 5
         self.posters = {}
         self.open_preview = open_preview
         self.video_preferences = video_preferences if video_preferences is not None else {
@@ -671,7 +673,7 @@ class ScriptView:
     @staticmethod
     def error_text(exc):
         text = str(exc) or type(exc).__name__
-        secrets = [*configured_api_keys(), configured_pexels_api_key()]
+        secrets = [*configured_api_keys(), *configured_pexels_api_keys()]
         for api_key in sorted((key for key in secrets if key), key=len, reverse=True):
             text = text.replace(api_key, "[ẩn API key]")
         return re.sub(r"(?i)([?&]key=)[^&\s]+", r"\1[ẩn]", text)
@@ -689,13 +691,14 @@ class ScriptView:
         self.progress.value = processed / total if total else 0
         self.progress_label.value = f"Đã xử lý {processed}/{total} dòng · {self.progress.value:.0%}"
 
-    async def download_with_progress(self, keyword, api_key, previous_clip="", beat_id="", visual_direction=""):
+    async def download_with_progress(self, keyword, api_key, previous_clip="", beat_id="", visual_direction="",
+                                    exclude_ids=None):
         updates = deque(maxlen=1)
         worker = asyncio.create_task(asyncio.to_thread(
             download_scene, keyword, api_key, self.library_root, self.database, self.cancel,
             updates.append, previous_clip, self.video_preferences["quality"],
             self.video_preferences["orientation"], beat_id, visual_direction,
-            self.video_preferences.get("source", "pixabay")))
+            self.video_preferences.get("source", "pixabay"), exclude_ids))
         while not worker.done():
             await asyncio.wait({worker}, timeout=0.1)
             if not updates and isinstance(api_key, ApiKeyPool):
@@ -728,14 +731,17 @@ class ScriptView:
         if self.cancel.is_set():
             raise InterruptedError("Đã hủy trong khi chờ API.")
 
-    async def download_with_retry(self, keyword, api_key, previous_clip, beat_id="", visual_direction=""):
+    async def download_with_retry(self, keyword, api_key, previous_clip, beat_id="", visual_direction="",
+                                 exclude_ids=None):
         if isinstance(api_key, ApiKeyPool):
-            return await self.download_with_progress(keyword, api_key, previous_clip, beat_id, visual_direction)
+            return await self.download_with_progress(keyword, api_key, previous_clip, beat_id,
+                                                     visual_direction, exclude_ids)
         for attempt in range(4):
             if self.cancel.is_set():
                 raise InterruptedError("Đã hủy tải.")
             try:
-                return await self.download_with_progress(keyword, api_key, previous_clip, beat_id, visual_direction)
+                return await self.download_with_progress(keyword, api_key, previous_clip, beat_id,
+                                                         visual_direction, exclude_ids)
             except PixabayRateLimitError as exc:
                 if attempt == 3:
                     raise
@@ -772,109 +778,132 @@ class ScriptView:
         self.progress_panel.visible = True
         self.file_progress.visible = True
         self.file_progress.value = None
-        self.file_label.value = "Đang chuẩn bị..."
+        self.file_label.value = f"Đang chuẩn bị tối đa {self.download_workers} luồng tải..."
         self.update_progress(0, len(selected))
         self.render()
         self.page.update()
         try:
-            for position, index in enumerate(selected, 1):
+            headers = list(self.data["headers"])
+            rows = [list(r) for r in self.data["rows"]]
+            for name in ("Status", "Selected clip URL / file", "File Name"):
+                if name not in headers:
+                    headers.append(name)
+                    for row in rows:
+                        row.append("")
+            keyword_header = ("Primary search keyword" if "Primary search keyword" in headers
+                              else "Primary Stock Keyword")
+            clip_column = headers.index("Selected clip URL / file")
+            status_column = headers.index("Status")
+            filename_column = headers.index("File Name")
+            script_excluded_ids = {video_id for row in rows
+                                   if (video_id := video_id_from_clip(row[clip_column])) is not None}
+            tasks = {}
+            loop = asyncio.get_running_loop()
+
+            def start_scene(index):
+                row = rows[index]
+                return loop.run_in_executor(
+                    executor, download_scene,
+                    row[headers.index(keyword_header)], api_key, self.library_root,
+                    self.database, self.cancel, None, row[clip_column],
+                    self.video_preferences["quality"], self.video_preferences["orientation"],
+                    row[headers.index("Beat ID")] if "Beat ID" in headers else "",
+                    row[headers.index("Visual Direction")] if "Visual Direction" in headers else "",
+                    source, script_excluded_ids)
+
+            executor = ThreadPoolExecutor(max_workers=self.download_workers,
+                                          thread_name_prefix="script-download")
+            next_position = 0
+            while next_position < len(selected) and len(tasks) < self.download_workers:
+                index = selected[next_position]
                 if self.cancel.is_set():
                     break
-                headers = list(self.data["headers"])
-                rows = [list(r) for r in self.data["rows"]]
-                for name in ("Status", "Selected clip URL / file"):
-                    if name not in headers:
-                        headers.append(name)
-                        for row in rows:
-                            row.append("")
-                row = rows[index]
-                clip_column = headers.index("Selected clip URL / file")
-                status_column = headers.index("Status")
-                existing = row[clip_column]
-                keyword_header = ("Primary search keyword" if "Primary search keyword" in headers
-                                  else "Primary Stock Keyword")
-                keyword = row[headers.index(keyword_header)]
-                beat_id = row[headers.index("Beat ID")] if "Beat ID" in headers else ""
-                visual_direction = row[headers.index("Visual Direction")] if "Visual Direction" in headers else ""
-                if "File Name" not in headers:
-                    headers.append("File Name")
-                    for existing_row in rows:
-                        existing_row.append("")
-                filename_column = headers.index("File Name")
-                self.message.value = f"Đang tải {position}/{len(selected)} · dòng {index + 1}: {keyword}"
-                self.file_label.value = f"Đang tìm video {source.title()} cho dòng {index + 1}..."
-                self.file_progress.value = None
-                self.page.update()
-                try:
-                    path = await self.download_with_retry(keyword, api_key, existing, beat_id, visual_direction)
-                except InterruptedError:
-                    break
-                except PixabayAccessPause:
-                    row[status_column] = "Paused: Pixabay access verification required"
-                    self.dismissed_errors.discard(tuple(row))
-                    self.busy = True
-                    self.resume_search.visible = True
-                    self.message.value = "Pixabay yêu cầu xác minh truy cập (Cloudflare). Kiểm tra trên trình duyệt rồi bấm Tiếp tục tìm kiếm."
-                    self.page.update()
-                    while not self.cancel.is_set():
-                        await asyncio.sleep(0.1)
-                        if not get_api_key_pool().pause_reason:
-                            break
-                    if not self.cancel.is_set():
-                        row[status_column] = ""
-                        try:
-                            path = await self.download_with_retry(keyword, api_key, existing, beat_id, visual_direction)
-                        except InterruptedError:
-                            break
-                        except Exception as exc:
-                            rate_limited = isinstance(exc, PixabayRateLimitError)
-                            row[status_column] = f"Lỗi: {self.error_text(exc)}"
+                tasks[start_scene(index)] = index
+                next_position += 1
+            rate_limited = False
+            finished_indices = set()
+            while tasks:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    index = tasks.pop(task)
+                    finished_indices.add(index)
+                    row = rows[index]
+                    try:
+                        path = task.result()
+                    except InterruptedError:
+                        if not self.cancel.is_set():
+                            row[status_column] = "Lỗi: Đã hủy lượt tìm kiếm."
                             failed += 1
+                    except PixabayAccessPause:
+                        row[status_column] = "Paused: Pixabay access verification required"
+                        self.resume_search.visible = True
+                        self.message.value = "Pixabay yêu cầu xác minh truy cập. Kiểm tra trên trình duyệt rồi bấm Tiếp tục tìm kiếm."
+                        self.page.update()
+                        while not self.cancel.is_set() and get_api_key_pool().pause_reason:
+                            await asyncio.sleep(0.1)
+                        if not self.cancel.is_set():
+                            try:
+                                path = await self.download_with_retry(
+                                    row[headers.index(keyword_header)], api_key, row[clip_column],
+                                    row[headers.index("Beat ID")] if "Beat ID" in headers else "",
+                                    row[headers.index("Visual Direction")] if "Visual Direction" in headers else "",
+                                    script_excluded_ids)
+                            except InterruptedError:
+                                break
+                            except Exception as exc:
+                                row[status_column] = f"Lỗi: {self.error_text(exc)}"
+                                failed += 1
+                                rate_limited = isinstance(exc, PixabayRateLimitError)
+                            else:
+                                row[clip_column] = path
+                                row[filename_column] = Path(path).name
+                                await self.update_video_durations(row, headers, original_path=path)
+                                row[status_column] = "Downloaded"
+                                completed += 1
+                                self.posters[path] = await asyncio.to_thread(thumbnail_bytes, Path(path))
                         else:
-                            rate_limited = False
-                            row[clip_column] = path
-                            row[filename_column] = Path(path).name
-                            await self.update_video_durations(row, headers, original_path=path)
-                            row[status_column] = "Downloaded"
-                            completed += 1
-                            if self.on_download_complete:
-                                self.on_download_complete()
-                            self.posters[path] = await asyncio.to_thread(thumbnail_bytes, Path(path))
+                            break
+                    except Exception as exc:
+                        row[status_column] = f"Lỗi: {self.error_text(exc)}"
+                        self.dismissed_errors.discard(tuple(row))
+                        failed += 1
+                        rate_limited = rate_limited or isinstance(exc, PixabayRateLimitError)
                     else:
-                        break
-                except Exception as exc:
-                    rate_limited = isinstance(exc, PixabayRateLimitError)
-                    row[status_column] = f"Lỗi: {self.error_text(exc)}"
-                    self.dismissed_errors.discard(tuple(row))
-                    failed += 1
-                else:
-                    rate_limited = False
-                    row[clip_column] = path
-                    row[filename_column] = Path(path).name
-                    await self.update_video_durations(row, headers, original_path=path)
-                    row[status_column] = "Downloaded"
-                    completed += 1
-                    if self.on_download_complete:
-                        self.on_download_complete()
-                    self.posters[path] = await asyncio.to_thread(thumbnail_bytes, Path(path))
-                updated = {**self.data, "headers": headers, "rows": rows}
-                self.mark_duration_errors(updated)
-                # Stop on a save error; do not silently continue with unrecorded assignments.
-                await asyncio.to_thread(save_tracker, updated, self.target)
-                self.data = updated
-                processed += 1
-                self.update_progress(processed, len(selected))
-                self.refresh_controls()
-                self.page.update()
-                if rate_limited:
-                    self.message.value = ("Đã dừng lượt tải sau các lần thử lại HTTP 429 từ API. "
-                                          "Các dòng chưa xử lý được giữ nguyên; hãy thử lại sau.")
-                    return
+                        row[clip_column] = path
+                        row[filename_column] = Path(path).name
+                        await self.update_video_durations(row, headers, original_path=path)
+                        row[status_column] = "Downloaded"
+                        completed += 1
+                        self.posters[path] = await asyncio.to_thread(thumbnail_bytes, Path(path))
+                        if self.on_download_complete:
+                            self.on_download_complete()
+                    if self.cancel.is_set():
+                        continue
+                    updated = {**self.data, "headers": headers, "rows": rows}
+                    self.mark_duration_errors(updated)
+                    await asyncio.to_thread(save_tracker, updated, self.target)
+                    self.data = updated
+                    processed += 1
+                    self.update_progress(processed, len(selected))
+                    self.message.value = f"Đang tải · hoàn tất {processed}/{len(selected)} dòng"
+                    self.refresh_controls()
+                    self.page.update()
+                    if rate_limited:
+                        self.cancel.set()
+                if not self.cancel.is_set():
+                    while next_position < len(selected) and len(tasks) < self.download_workers:
+                        index = selected[next_position]
+                        tasks[start_scene(index)] = index
+                        next_position += 1
             self.message.value = (f'{"Đã hủy. " if self.cancel.is_set() else ""}'
                                   f"Đã tải {completed}, lỗi {failed} dòng.")
+            if rate_limited:
+                self.message.value = ("Đã dừng lượt tải sau HTTP 429 từ API. "
+                                      "Các dòng chưa xử lý được giữ nguyên; hãy thử lại sau.")
         except Exception as exc:
             self.message.value = f"Đã dừng: {self.error_text(exc)}. Video đã tải vẫn được giữ trong Library."
         finally:
+            executor.shutdown(wait=False, cancel_futures=True) if "executor" in locals() else None
             self.busy = False
             self.cancel_button.visible = False
             self.file_progress.visible = False

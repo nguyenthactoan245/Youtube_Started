@@ -6,7 +6,7 @@
 
 1. Mở PowerShell tại thư mục `Stock`.
 2. Cài Flet nếu máy chưa có: `python -m pip install -r requirements.txt`.
-3. Vào **Setup → Thêm key → Lưu danh sách key** để cấu hình Pixabay và ô **Pexels API key → Lưu Pexels key** để cấu hình Pexels; hoặc tạo `.env` từ `.env.example` và điền `PIXABAY_API_KEYS=key_1,key_2` cùng `PEXELS_API_KEY=...`. Cấu hình cũ `PIXABAY_API_KEY` vẫn được hỗ trợ nếu danh sách mới trống. File `.env` không được Git theo dõi.
+3. Vào **Setup** để thêm một hoặc nhiều Pixabay và Pexels API key rồi lưu từng danh sách. Pixabay keys được luân phiên; với Pexels app dùng key đầu tiên trong danh sách. Pexels keys bổ sung được giữ trong Setup để bạn quản lý và đổi key chủ động; chúng không cộng quota. Có thể tạo `.env` từ `.env.example` và điền `PIXABAY_API_KEYS=key_1,key_2` cùng `PEXELS_API_KEYS=key_1,key_2`. Cấu hình cũ `PIXABAY_API_KEY` và `PEXELS_API_KEY` vẫn được hỗ trợ. File `.env` không được Git theo dõi.
 
 ### Nhiều API key
 
@@ -25,6 +25,10 @@ Khi gặp lỗi: vào **Setup → Xuất log lỗi**, chọn nơi lưu `stock-di
 4. Chạy: `python main.py`.
 
 Nhập keyword, số lượng từ 1 đến 200 và nhấn **Tìm & tải**. Ứng dụng chọn video chưa có trong database theo ID Pixabay trên toàn bộ thư viện (kể cả keyword khác), duyệt các trang kết quả nếu cần. Video được tải song song tối đa ba file vào `library/<keyword>/`. Nếu kết quả khả dụng không đủ, ứng dụng tải số video mới tìm được. Lượt tải lỗi/hủy có thể thử lại. Xóa video bằng nút Xóa trong ứng dụng sẽ xóa cả file và bản ghi, nên lần tìm sau có thể tải lại cùng ID Pixabay.
+
+Trong mục **Download**, bạn cũng có thể dán một URL video Pexels vào ô **Link video Pexels** và bấm **Tải link Pexels**. Ứng dụng kiểm tra liên kết, lấy URL MP4 công khai từ nút tải chính thức của Pexels rồi lưu video vào `library/<tên-video>/`; cách này không cần Pexels API key. Link được giới hạn ở trang video `pexels.com`, video trùng ID đã có trong Library sẽ không tải thêm.
+
+Khi chọn **Crawl trực tiếp** và nguồn **Pexels**, nút **Tìm & tải** dùng Playwright mở Google Chrome để tìm theo keyword, lấy các trang video công khai rồi tải tối đa số lượng yêu cầu qua liên kết tải Pexels, không gọi API. Chỉ dùng tự động hóa này khi đã được Pexels cho phép; máy cần cài Google Chrome. Nếu Pexels/Cloudflare trả về trang xác minh hoặc chặn truy cập, lượt tự động dừng và báo lỗi; ứng dụng không tự giải CAPTCHA hay thử né bước chặn.
 
 Lịch sử lưu trong `data/stock.db` (SQLite), tách với MP4/JPG. Lần chạy đầu, app nhập các MP4 cũ trong `library/` và `downloads/` mà không chuyển hay xóa file. File có tên `<Pixabay ID>_<rộng>x<cao>.mp4` được nhận diện bằng ID; tên không rõ nguồn vẫn hiển thị trong Library để xem xét, nhưng không thể dùng để chứng minh trùng ID. Không xóa database nếu muốn giữ khả năng chống trùng. Mở mục **Library** để xem lịch sử và mở các MP4 còn trên đĩa.
 

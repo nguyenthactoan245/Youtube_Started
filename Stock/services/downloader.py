@@ -65,7 +65,7 @@ def _download_one(video: Video, destination: Path, cancel: Event, report: Progre
             raise InterruptedError
         temporary.replace(target)
         _download_thumbnail(video, target)
-        if database and owner:
+        if database and owner and not name_prefix:
             database.record(video.id, owner, "completed", source=video.source)
         report(DownloadEvent(video.id, "done", 1, f"Đã lưu: {target.name}"))
     except InterruptedError:

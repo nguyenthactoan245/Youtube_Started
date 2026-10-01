@@ -4,18 +4,20 @@ from __future__ import annotations
 import flet as ft
 
 
-def build_video_settings(preferences: dict[str, str], include_source: bool = False) -> ft.Row:
+def build_video_settings(preferences: dict[str, str], include_source: bool = False,
+                         include_method: bool = False) -> ft.Row:
     quality = ft.Dropdown(
         label="Chất lượng",
         value=preferences.get("quality", "2K"),
         width=170,
-        options=[ft.DropdownOption(key=value, text=value) for value in ("HD", "2K", "4K")],
+        options=[ft.DropdownOption(key=value, text=value) for value in ("All", "HD", "2K", "4K")],
     )
     orientation = ft.Dropdown(
         label="Kích thước",
         value=preferences.get("orientation", "landscape"),
         width=190,
         options=[
+            ft.DropdownOption(key="all", text="All"),
             ft.DropdownOption(key="landscape", text="Ngang"),
             ft.DropdownOption(key="portrait", text="Dọc"),
         ],
@@ -46,4 +48,17 @@ def build_video_settings(preferences: dict[str, str], include_source: bool = Fal
     row = ft.Row(controls=controls, spacing=12,
                  vertical_alignment=ft.CrossAxisAlignment.CENTER, wrap=True)
     row.source_dropdown = source
+    method = None
+    if include_method:
+        method = ft.Dropdown(
+            label="Phương thức",
+            value=preferences.get("method", "direct"),
+            width=190,
+            options=[
+                ft.DropdownOption(key="api", text="Crawl by API"),
+                ft.DropdownOption(key="direct", text="Crawl trực tiếp"),
+            ],
+        )
+        row.controls.insert(len(row.controls) - (1 if source is not None else 0), method)
+    row.method_dropdown = method
     return row

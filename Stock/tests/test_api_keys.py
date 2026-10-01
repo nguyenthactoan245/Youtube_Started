@@ -15,7 +15,8 @@ from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app_config import configured_api_keys, parse_api_keys, save_api_keys
+from app_config import (configured_api_keys, configured_pexels_api_keys, parse_api_keys,
+                        save_api_keys, save_pexels_api_keys)
 from api_key_settings import ApiKeySettings
 from services.api_keys import ApiKeyPool, get_api_key_pool
 from services.pixabay import PixabayError, PixabayRateLimitError, PixabayAccessPause, _fetch_payload, search_page
@@ -302,12 +303,24 @@ class ApiKeyTests(unittest.TestCase):
             self.assertNotIn('private path', settings.status.value)
 
     def test_settings_save_pexels_key(self):
-        with patch("api_key_settings.save_pexels_api_key", return_value="pexels-test-key") as save:
+        with patch("api_key_settings.save_pexels_api_keys", return_value=["pexels-test-key"]) as save:
             settings = ApiKeySettings(SimpleNamespace(update=lambda: None), Path("unused"))
-            settings.pexels_field.value = "pexels-test-key"
+            settings.pexels_fields[0].value = "pexels-test-key"
             asyncio.run(settings.save_pexels(None))
             save.assert_called_once_with("pexels-test-key", Path("unused"))
             self.assertIn("Đã lưu", settings.pexels_status.value)
+
+    def test_save_multiple_pexels_keys_and_legacy_key(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"PEXELS_API_KEY": "old"}, clear=True):
+            root = Path(folder)
+            (root / ".env").write_text("OTHER=value\nPEXELS_API_KEY=old\n", encoding="utf-8")
+            self.assertEqual(configured_pexels_api_keys(), ["old"])
+            self.assertEqual(save_pexels_api_keys("first, second\nfirst", root), ["first", "second"])
+            self.assertEqual(configured_pexels_api_keys(), ["first", "second"])
+            saved = (root / ".env").read_text(encoding="utf-8")
+            self.assertIn("OTHER=value", saved)
+            self.assertIn("PEXELS_API_KEYS=first,second", saved)
+            self.assertNotIn("PEXELS_API_KEY=old", saved)
 
     def test_shared_pool_and_save_during_inflight_request(self):
         with patch.dict(os.environ, {'PIXABAY_API_KEYS': 'alpha,beta'}, clear=True):

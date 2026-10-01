@@ -12,10 +12,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models import Video
 from services.downloader import safe_folder_name
-from services.pixabay import PixabayError, _cache_file, search_page, search_videos
+from services.pixabay import PixabayError, _cache_file, _choose_rendition, search_page, search_videos
 
 
 class ServiceTests(unittest.TestCase):
+    def test_pixabay_all_quality_chooses_highest_resolution(self) -> None:
+        renditions = {
+            "small": {"url": "small.mp4", "width": 640, "height": 360},
+            "medium": {"url": "medium.mp4", "width": 1280, "height": 720},
+            "large": {"url": "large.mp4", "width": 1920, "height": 1080},
+        }
+        self.assertEqual(_choose_rendition(renditions, "All")["url"], "large.mp4")
+
     def test_safe_folder_name(self) -> None:
         self.assertEqual(safe_folder_name("Moscow / 2026"), "Moscow_2026")
         self.assertEqual(safe_folder_name("..."), "untitled")

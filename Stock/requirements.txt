@@ -1,3 +1,4 @@
 flet==0.85.3
 flet-desktop==0.85.3
 flet-video==0.85.3
+playwright==1.63.0

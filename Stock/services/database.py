@@ -161,15 +161,11 @@ class VideoDatabase:
             row = db.execute("SELECT status, hidden_at FROM videos WHERE source=? AND video_id=?",
                              (source, video.id)).fetchone()
             if row and row['hidden_at'] is None and row['status'] not in ('failed', 'cancelled'):
-                # A replacement in Script may reserve the same Pixabay ID again.
-                if not filename_prefix or row['status'] != 'completed':
-                    return False
-                existing = db.execute("SELECT file_path FROM videos WHERE source=? AND video_id=?",
-                                      (source, video.id)).fetchone()
-                if existing and Path(existing['file_path']).name.startswith(filename_prefix):
-                    return False
-                # Keep the old file intact and let the caller save the replacement
-                # under its beat label; this record will point to the new path.
+                return False
+            path_owner = db.execute("SELECT source, video_id, status FROM videos WHERE file_path=?",
+                                    (str(target.resolve()),)).fetchone()
+            if path_owner and (path_owner['source'], path_owner['video_id']) != (source, video.id):
+                return False
             db.execute("""INSERT INTO videos
                 (source, video_id, metadata, keyword, file_path, status, owner, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
@@ -196,12 +192,38 @@ class VideoDatabase:
                 WHERE source=? AND video_id=? AND owner=?""",
                 (status, error, time.time(), status, time.time(), status, status, source, video_id, owner))
 
-    def set_file_path(self, video_id: int, file_path: Path, source: str = "pixabay") -> None:
-        """Update a reserved record to the final Script filename."""
+    def set_file_path(self, video_id: int, file_path: Path, source: str = "pixabay",
+                      owner: str | None = None) -> None:
+        """Finalize a reserved record at its final Script filename."""
         resolved = str(Path(file_path).resolve())
         with self.connect() as db:
-            db.execute("UPDATE videos SET file_path=?, thumbnail_path=?, updated_at=? WHERE source=? AND video_id=?",
-                       (resolved, str(Path(resolved).with_suffix('.jpg')), time.time(), source, video_id))
+            now = time.time()
+            db.execute("UPDATE videos SET file_path=?, thumbnail_path=?, status='completed', "
+                       "completed_at=?, updated_at=?, owner=NULL, error='' "
+                       "WHERE source=? AND video_id=? AND (? IS NULL OR owner=?)",
+                       (resolved, str(Path(resolved).with_suffix('.jpg')), now, now, source, video_id,
+                        owner, owner))
+
+    def update_completed_video_metadata(self, video: Video, file_path: Path) -> None:
+        """Save dimensions probed from the completed video file."""
+        resolved = str(Path(file_path).resolve())
+        with self.connect() as db:
+            db.execute("""UPDATE videos SET metadata=?, file_path=?, thumbnail_path=?, updated_at=?
+                WHERE source=? AND video_id=? AND status='completed'""",
+                (json.dumps(asdict(video), ensure_ascii=False), resolved,
+                 str(Path(resolved).with_suffix('.jpg')), time.time(), video.source, video.id))
+
+    def discard_completed_download(self, source: str, video_id: int) -> bool:
+        """Remove a completed download rejected by post-download validation."""
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT id FROM videos WHERE source=? AND video_id=? "
+                             "AND status='completed'", (source, video_id)).fetchone()
+            if row is None:
+                return False
+            db.execute("DELETE FROM video_placements WHERE video_record_id=?", (row["id"],))
+            db.execute("DELETE FROM videos WHERE id=?", (row["id"],))
+            return True
 
     def library(self) -> list[dict]:
         with self.connect() as db:

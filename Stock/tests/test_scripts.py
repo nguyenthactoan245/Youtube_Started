@@ -8,9 +8,10 @@ import uuid
 from contextlib import contextmanager
 import unittest
 import zipfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
-from threading import Event
+from threading import Event, Lock
 from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -43,7 +44,7 @@ def make_workbook(path):
         z.writestr("xl/workbook.xml", '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Footage Tracker" r:id="r1"/></sheets></workbook>')
         z.writestr("xl/_rels/workbook.xml.rels", '<Relationships><Relationship Id="r1" Target="worksheets/tracker.xml"/></Relationships>')
         z.writestr("xl/sharedStrings.xml", '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><si><t>Scene ID</t></si><si><t>Voice-over (original)</t></si></sst>')
-        z.writestr("xl/worksheets/tracker.xml", '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t>Notes</t></is></c><c r="C1" t="s"><v>1</v></c></row><row><c r="A2" t="inlineStr"><is><t>S001</t></is></c><c r="C2" t="inlineStr"><is><t>Kịch bản tiếng Việt</t></is></c></row></sheetData></worksheet>')
+        z.writestr("xl/worksheets/tracker.xml", '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><t>Notes</t></is></c><c r="C1" t="s"><v>1</v></c></row><row><c r="A2" t="inlineStr"><is><t>S001</t></is></c><c r="C2" t="inlineStr"><is><t>Ká»‹ch báº£n tiáº¿ng Viá»‡t</t></is></c></row></sheetData></worksheet>')
 
 
 class ScriptTests(unittest.TestCase):
@@ -54,6 +55,17 @@ class ScriptTests(unittest.TestCase):
         dropdown = view.video_settings.source_dropdown
         self.assertEqual(dropdown.value, "pexels")
         self.assertEqual([option.key for option in dropdown.options], ["pixabay", "pexels"])
+
+    def test_import_rounds_duration_to_one_decimal_place(self):
+        with temporary_directory() as directory:
+            source = directory / "duration.xlsx"
+            with zipfile.ZipFile(source, "w") as z:
+                z.writestr("xl/workbook.xml", '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Footage Tracker" r:id="r1"/></sheets></workbook>')
+                z.writestr("xl/_rels/workbook.xml.rels", '<Relationships><Relationship Id="r1" Target="worksheets/tracker.xml"/></Relationships>')
+                z.writestr("xl/worksheets/tracker.xml", '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row><c r="A1" t="inlineStr"><is><t>Scene ID</t></is></c><c r="B1" t="inlineStr"><is><t>Voice-over (original)</t></is></c><c r="C1" t="inlineStr"><is><t>Duration (s)</t></is></c></row><row><c r="A2" t="inlineStr"><is><t>S001</t></is></c><c r="B2" t="inlineStr"><is><t>Test</t></is></c><c r="C2"><v>12.34</v></c></row><row><c r="A3" t="inlineStr"><is><t>S002</t></is></c><c r="B3" t="inlineStr"><is><t>Test</t></is></c><c r="C3"><v>8</v></c></row></sheetData></worksheet>')
+            data = read_tracker(source)
+            duration_column = data["headers"].index("Duration (s)")
+            self.assertEqual([row[duration_column] for row in data["rows"]], ["12.3", "8.0"])
 
     def test_script_scene_download_uses_pexels_source(self):
         with temporary_directory() as directory:
@@ -160,14 +172,14 @@ class ScriptTests(unittest.TestCase):
     def test_clear_log_preserves_data_and_new_errors_reappear(self):
         view = ScriptView(SimpleNamespace(update=lambda: None), None, Path("unused"))
         view.data = {"filename": "test.xlsx", "headers": ["Scene ID", "Status"],
-                     "rows": [["S001", "Lỗi: HTTP 429"]]}
+                     "rows": [["S001", "Lá»—i: HTTP 429"]]}
         view.render()
         self.assertTrue(view.error_details.visible)
         view.clear_log(None)
         view.render()
         self.assertFalse(view.error_details.visible)
-        self.assertEqual(view.data["rows"][0][1], "Lỗi: HTTP 429")
-        view.data["rows"].append(["S002", "Lỗi: HTTP 429"])
+        self.assertEqual(view.data["rows"][0][1], "Lá»—i: HTTP 429")
+        view.data["rows"].append(["S002", "Lá»—i: HTTP 429"])
         view.render()
         self.assertTrue(view.error_details.visible)
         self.assertEqual(len(view.error_details.controls), 2)
@@ -212,7 +224,7 @@ class ScriptTests(unittest.TestCase):
                                preview, AsyncMock(), report)
             asyncio.run(tile.toggle(None))
             self.assertIsNone(tile.player)
-            self.assertIn("Không tìm thấy", report.call_args.args[0])
+            self.assertIn("KhÃ´ng tÃ¬m tháº¥y", report.call_args.args[0])
             preview.assert_not_called()
 
     def test_replace_excludes_current_video_even_without_database_record(self):
@@ -277,7 +289,7 @@ class ScriptTests(unittest.TestCase):
                 self.assertEqual(Path(path).name,
                                  "VB-001_Alaska_North_America_establishing_123_1280x720.mp4")
                 self.assertEqual(Path(database.library()[0]["file_path"]), Path(path))
-                with self.assertRaisesRegex(ValueError, "Không còn video"):
+                with self.assertRaisesRegex(ValueError, "KhÃ´ng cÃ²n video"):
                     download_scene("Utah", "test", directory / "library", database, Event())
 
     def test_scene_failed_download_can_retry(self):
@@ -300,7 +312,7 @@ class ScriptTests(unittest.TestCase):
             source = Path(directory) / "tracker.xlsx"
             make_workbook(source)
             data = read_tracker(source)
-            self.assertEqual(data["rows"], [["S001", "", "Kịch bản tiếng Việt"]])
+            self.assertEqual(data["rows"], [["S001", "", "Ká»‹ch báº£n tiáº¿ng Viá»‡t"]])
             target = Path(directory) / "data/script.json"
             save_tracker(data, target)
             self.assertEqual(load_tracker(target), data)
@@ -320,7 +332,7 @@ class ScriptTests(unittest.TestCase):
                              ["STT", "Thumbnail video", "Trimed video",
                               "Thumbnail Video Duration", "Trimed video Duration", "Scene ID"])
             self.assertEqual(view.table.controls[1].content.controls[1].controls[0]
-                             .content.content.value, "Chưa có video")
+                             .content.content.value, "ChÆ°a cÃ³ video")
             original = target.read_bytes()
             picker.pick_files.return_value = []
             asyncio.run(view.import_file(None))
@@ -328,7 +340,7 @@ class ScriptTests(unittest.TestCase):
             source.write_text("broken", encoding="utf-8")
             picker.pick_files.return_value = [SimpleNamespace(path=str(source))]
             asyncio.run(view.import_file(None))
-            self.assertIn("Import không thành công", view.message.value)
+            self.assertIn("Import khÃ´ng thÃ nh cÃ´ng", view.message.value)
             self.assertFalse(view.import_button.disabled)
             self.assertEqual(target.read_bytes(), original)
             reopened = ScriptView(page, picker, target)
@@ -378,9 +390,9 @@ class ScriptTests(unittest.TestCase):
             view.edit_values[1]["Start"] = "00:00:01.500"
             asyncio.run(view.save_script_edits(None))
             self.assertTrue(view.edit_mode)
-            self.assertIn("bị trùng", view.message.value)
-            self.assertIn("Không thể lưu chỉnh sửa", page.dialog.title.value)
-            self.assertIn("dòng 1 và dòng 2", page.dialog.content.value)
+            self.assertIn("bá»‹ trÃ¹ng", view.message.value)
+            self.assertIn("KhÃ´ng thá»ƒ lÆ°u chá»‰nh sá»­a", page.dialog.title.value)
+            self.assertIn("dÃ²ng 1 vÃ  dÃ²ng 2", page.dialog.content.value)
             self.assertEqual(view.data["rows"][1][1], "00:00:02.000")
             self.assertFalse(view.target.exists())
 
@@ -393,7 +405,7 @@ class ScriptTests(unittest.TestCase):
         row = view.data["rows"][0]
         self.assertEqual(view.duration_error_columns(row, view.data["headers"]),
                          {"Thumbnail Video Duration"})
-        self.assertIn("Lỗi duration:", row[view.data["headers"].index("Status")])
+        self.assertIn("Lá»—i duration:", row[view.data["headers"].index("Status")])
         view.render()
         duration_cell = view.table.controls[1].content.controls[2]
         self.assertEqual(duration_cell.bgcolor, "#7f1d1d")
@@ -412,7 +424,7 @@ class ScriptTests(unittest.TestCase):
             view.selected = {0}
             def trim_with_progress(*args):
                 self.assertTrue(view.trim_progress_panel.visible)
-                self.assertIn("FFmpeg đang xử lý", view.trim_progress_label.value)
+                self.assertIn("FFmpeg Ä‘ang xá»­ lÃ½", view.trim_progress_label.value)
                 return trimmed
             with patch("script_view.trim_video", return_value=trimmed) as trim, \
                  patch("script_view.thumbnail_bytes", return_value=None):
@@ -492,21 +504,21 @@ class ScriptTests(unittest.TestCase):
                                   ["source3.mp4", str(directory / "missing.mp4")]]}
             view.set_filter("trimmed")
             self.assertEqual(view.filtered_indices(), [0])
-            self.assertEqual(view.filter_count.value, "1 / 3 dòng")
+            self.assertEqual(view.filter_count.value, "1 / 3 dÃ²ng")
             view.set_filter("untrimmed")
             self.assertEqual(view.filtered_indices(), [1, 2])
-            self.assertEqual(view.filter_count.value, "2 / 3 dòng")
+            self.assertEqual(view.filter_count.value, "2 / 3 dÃ²ng")
 
     def test_error_filter_includes_duration_and_status_errors(self):
         view = ScriptView(SimpleNamespace(update=lambda: None), None, Path("unused"))
         view.data = {"filename": "test.xlsx", "headers": [
             "Duration (s)", "Thumbnail Video Duration", "Trimed video Duration", "Status"],
-            "rows": [["4.0", "3.0", "4.0", "Downloaded | Lỗi duration: source too short"],
-                     ["4.0", "", "", "Lỗi: Pixabay unavailable"],
+            "rows": [["4.0", "3.0", "4.0", "Downloaded | Lá»—i duration: source too short"],
+                     ["4.0", "", "", "Lá»—i: Pixabay unavailable"],
                      ["4.0", "5.0", "4.5", "Downloaded"]]}
         view.set_filter("errors")
         self.assertEqual(view.filtered_indices(), [0, 1])
-        self.assertEqual(view.filter_count.value, "2 / 3 dòng")
+        self.assertEqual(view.filter_count.value, "2 / 3 dÃ²ng")
 
     def test_select_all_trimmed_toggles_only_valid_trimmed_rows(self):
         with temporary_directory() as directory:
@@ -558,7 +570,7 @@ class ScriptTests(unittest.TestCase):
         self.assertIs(view.table.controls[1], original_row)
         self.assertIs(view.table.controls[1].content.controls[1], original_stack)
         self.assertTrue(checkbox.value)
-        self.assertEqual(view.selection_count.value, "Đã chọn 1 / 1 dòng")
+        self.assertEqual(view.selection_count.value, "ÄÃ£ chá»n 1 / 1 dÃ²ng")
 
     def test_delete_save_error_preserves_rows_and_selection(self):
         with temporary_directory() as directory:
@@ -616,6 +628,38 @@ class ScriptTests(unittest.TestCase):
             saved = load_tracker(target)
             self.assertEqual(saved["rows"][0][saved["headers"].index("Selected clip URL / file")], str(replacement))
 
+    def test_script_download_runs_up_to_five_rows_concurrently(self):
+        with temporary_directory() as directory:
+            view = ScriptView(SimpleNamespace(update=lambda: None), None,
+                              directory / "script.json", object(), directory)
+            view.data = {"filename": "test.xlsx", "headers": ["Scene ID", "Primary search keyword"],
+                         "rows": [[str(i), f"keyword-{i}"] for i in range(7)]}
+            view.selected = set(range(7))
+            active = 0
+            max_active = 0
+            lock = Lock()
+
+            def download(keyword, *args):
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.03)
+                with lock:
+                    active -= 1
+                return str(directory / f"{keyword}.mp4")
+
+            with patch.dict("os.environ", {"PIXABAY_API_KEY": "test"}), \
+                 patch("script_view.download_scene", side_effect=download), \
+                 patch("script_view.thumbnail_bytes", return_value=None):
+                asyncio.run(view.download_selected(None))
+            saved = load_tracker(directory / "script.json")
+            clip_column = saved["headers"].index("Selected clip URL / file")
+            self.assertEqual([row[clip_column] for row in saved["rows"]],
+                             [str(directory / f"keyword-{i}.mp4") for i in range(7)])
+            self.assertEqual(view.progress.value, 1)
+            self.assertEqual(max_active, 5)
+
     def test_cancel_stops_before_next_row(self):
         with temporary_directory() as directory:
             view = ScriptView(SimpleNamespace(update=lambda: None), None, directory / "script.json", object(), directory)
@@ -632,7 +676,7 @@ class ScriptTests(unittest.TestCase):
                 asyncio.run(view.download_selected(None))
                 self.assertEqual(download.call_count, 1)
             self.assertFalse(view.busy)
-            self.assertIn("Đã hủy", view.message.value)
+            self.assertIn("ÄÃ£ há»§y", view.message.value)
             self.assertEqual(view.progress.value, 0)
             self.assertFalse(view.file_progress.visible)
 

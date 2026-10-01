@@ -4,8 +4,10 @@ import asyncio
 import os
 import sqlite3
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
+from weakref import WeakKeyDictionary
 
 import flet as ft
 import flet_video as ftv
@@ -19,9 +21,14 @@ from video_settings import build_video_settings
 from services.assets import delete_videos, export_videos, export_videos_zip
 from services.catalog import select_unique
 from services.database import VideoDatabase
-from services.downloader import download_many, footage_filename
+from services.downloader import download_many, footage_filename, safe_folder_name
 from services.pixabay import PixabayError, PixabayAccessPause
 from services.pexels import PexelsError, select_unique as select_pexels_unique
+from services.pexels_browser import (PexelsBrowserBlocked, PexelsBrowserSearchError,
+                                     search_videos as search_pexels_videos_direct)
+from services.pexels_link import PexelsLinkError, pexels_video_id, resolve_pexels_video
+from services.pexels_verified import (download_matching_pexels_videos, orientation_matches,
+                                      probe_video_dimensions)
 from services.thumbnails import is_jpeg, thumbnail_bytes
 
 ROOT = DATA_ROOT
@@ -31,6 +38,7 @@ WINDOW_ICON = ASSETS_ROOT / "stock-check.ico"
 SIDEBAR_LOGO = "5166961.png"
 PREVIEW_WIDTH = 1280
 PREVIEW_HEIGHT = 720
+LIBRARY_THUMBNAIL_CACHE: WeakKeyDictionary[VideoDatabase, dict[int, dict]] = WeakKeyDictionary()
 
 
 def build_preview_title(text: str) -> ft.Container:
@@ -76,6 +84,21 @@ def format_duration(seconds: int) -> str:
     return f"{seconds // 60}:{seconds % 60:02d}"
 
 
+def build_video_thumbnail(video: Video, *, fit: ft.BoxFit = ft.BoxFit.COVER) -> ft.Container:
+    """Return an image or a visible placeholder when a source has no poster URL."""
+    content: ft.Control
+    if video.thumbnail:
+        content = ft.Image(src=video.thumbnail, fit=fit, expand=True)
+    else:
+        content = ft.Icon(ft.Icons.VIDEO_FILE_OUTLINED, size=42, color=ft.Colors.BLUE_GREY_300)
+    return ft.Container(
+        expand=True,
+        bgcolor="#0b1020",
+        alignment=ft.Alignment(0, 0),
+        content=content,
+    )
+
+
 def list_library_videos(root: Path = LIBRARY_ROOT) -> list[Path]:
     """Return completed library videos, newest first."""
     if not root.exists():
@@ -95,17 +118,33 @@ def library_poster(video_path: Path) -> bytes | None:
 
 
 def load_library_entries(database: VideoDatabase) -> list[dict]:
-    """All disk and image work for a Library refresh runs in a worker thread."""
+    """Read Library records and reuse poster bytes for unchanged local videos."""
     records = database.library()
+    cached_records = LIBRARY_THUMBNAIL_CACHE.get(database, {})
     for record in records:
         file = Path(record["file_path"])
         try:
-            record["size_on_disk"] = file.stat().st_size
+            file_stat = file.stat()
             record["exists_on_disk"] = file.is_file()
+            record["size_on_disk"] = file_stat.st_size if record["exists_on_disk"] else 0
+            record["file_mtime_ns"] = file_stat.st_mtime_ns if record["exists_on_disk"] else 0
         except OSError:
             record["size_on_disk"] = 0
             record["exists_on_disk"] = False
-        record["poster_bytes"] = thumbnail_bytes(file) if record["exists_on_disk"] else None
+            record["file_mtime_ns"] = 0
+        previous = cached_records.get(record["id"])
+        unchanged = (
+            record["exists_on_disk"] and previous
+            and previous.get("exists_on_disk")
+            and previous.get("file_path") == record["file_path"]
+            and previous.get("size_on_disk") == record["size_on_disk"]
+            and previous.get("file_mtime_ns") == record["file_mtime_ns"]
+        )
+        record["poster_bytes"] = (
+            previous.get("poster_bytes") if unchanged
+            else thumbnail_bytes(file) if record["exists_on_disk"] else None
+        )
+    LIBRARY_THUMBNAIL_CACHE[database] = {record["id"]: record for record in records}
     return records
 
 
@@ -178,7 +217,7 @@ def build_preview_dialog(
     poster = ft.Container(
         expand=True,
         content=ft.Stack([
-            ft.Image(src=video.thumbnail, fit=ft.BoxFit.COVER, expand=True),
+            build_video_thumbnail(video),
             ft.Container(expand=True, alignment=ft.Alignment(0, 0)),
         ]),
     )
@@ -313,12 +352,58 @@ async def main(page: ft.Page) -> None:
     preview_dialog: ft.AlertDialog | None = None
     action_busy = False
     cards: dict[int, list[tuple[ft.ProgressBar, ft.Text]]] = {}
+    thumbnail_slots: dict[int, list[ft.Container]] = {}
     download_videos: dict[int, Video] = {}
     selected_download: set[int] = set()
     download_select_controls: dict[int, list[tuple[ft.IconButton, ft.Container]]] = {}
     download_selected_count = ft.Text("0 đã chọn", size=12, color=ft.Colors.BLUE_GREY_300)
-    video_preferences = {"quality": "2K", "orientation": "landscape", "source": "pixabay"}
-    download_video_settings = build_video_settings(video_preferences, include_source=True)
+    video_preferences = {"quality": "2K", "orientation": "landscape", "source": "pexels",
+                         "method": "direct"}
+    download_video_settings = build_video_settings(
+        video_preferences, include_source=True, include_method=True)
+    pexels_url = ft.TextField(
+        label="Link video Pexels",
+        hint_text="https://www.pexels.com/video/ten-video-123456/",
+        expand=True,
+    )
+    pexels_link_button = ft.OutlinedButton("Tải link Pexels", icon=ft.Icons.LINK, disabled=True)
+    keyword_download_row = ft.Row(
+        [keyword, amount, start, cancel_button, resume_search],
+        vertical_alignment=ft.CrossAxisAlignment.END,
+    )
+    pexels_direct_row = ft.Row(
+        [pexels_url, pexels_link_button],
+        vertical_alignment=ft.CrossAxisAlignment.END,
+    )
+
+    def set_download_buttons_idle(*, busy: bool = False) -> None:
+        source = video_preferences.get("source", "pexels")
+        start.disabled = busy
+        pexels_link_button.disabled = busy or source != "pexels"
+        pexels_link_button.tooltip = (
+            "Tải link Pexels" if source == "pexels"
+            else "Crawl trực tiếp hiện chỉ hỗ trợ Pexels"
+        )
+
+    def update_download_method(_: ft.ControlEvent | None = None) -> None:
+        if _ is not None:
+            video_preferences["method"] = _.control.value or "direct"
+        set_download_buttons_idle(busy=overall.visible)
+        if _ is not None:
+            page.update()
+
+    method_dropdown = getattr(download_video_settings, "method_dropdown", None)
+    if method_dropdown:
+        method_dropdown.on_change = update_download_method
+    source_dropdown = getattr(download_video_settings, "source_dropdown", None)
+    if source_dropdown:
+        def update_download_source(event: ft.ControlEvent) -> None:
+            video_preferences["source"] = event.control.value or "pexels"
+            set_download_buttons_idle(busy=overall.visible)
+            page.update()
+
+        source_dropdown.on_change = update_download_source
+    set_download_buttons_idle()
     download_select_all = ft.IconButton(icon=ft.Icons.SELECT_ALL, tooltip="Chọn tất cả", disabled=True)
     download_delete = ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, tooltip="Xóa video đã chọn", disabled=True)
     download_save = ft.IconButton(icon=ft.Icons.DOWNLOAD, tooltip="Xuất video ra thư mục khác", disabled=True)
@@ -390,6 +475,8 @@ async def main(page: ft.Page) -> None:
         selector = ft.IconButton(icon=ft.Icons.CHECK_BOX_OUTLINE_BLANK, icon_color=ft.Colors.WHITE,
                                  tooltip="Chọn video", on_click=lambda _: toggle_download_selection(video.id))
         cards.setdefault(video.id, []).append((progress, state))
+        thumbnail = build_video_thumbnail(video)
+        thumbnail_slots.setdefault(video.id, []).append(thumbnail)
         container = ft.Container(
             data=video.id,
             border_radius=12,
@@ -402,7 +489,7 @@ async def main(page: ft.Page) -> None:
                     ft.Container(
                         aspect_ratio=16 / 9,
                         content=ft.Stack([
-                            ft.Image(src=video.thumbnail, fit=ft.BoxFit.COVER, expand=True),
+                            thumbnail,
                             ft.Container(
                                 right=8, bottom=8, bgcolor="#99000000", border_radius=6,
                                 padding=ft.Padding.symmetric(horizontal=7, vertical=3),
@@ -436,6 +523,8 @@ async def main(page: ft.Page) -> None:
         selector = ft.IconButton(icon=ft.Icons.CHECK_BOX_OUTLINE_BLANK, icon_color=ft.Colors.WHITE,
                                  tooltip="Chọn video", on_click=lambda _: toggle_download_selection(video.id))
         cards.setdefault(video.id, []).append((progress, state))
+        thumbnail = build_video_thumbnail(video)
+        thumbnail_slots.setdefault(video.id, []).append(thumbnail)
         container = ft.Container(
             data=video.id,
             padding=ft.Padding.all(10),
@@ -444,7 +533,7 @@ async def main(page: ft.Page) -> None:
             on_click=lambda _: show_preview(video),
             content=ft.Row(controls=[
                 selector,
-                ft.Container(width=160, aspect_ratio=16 / 9, clip_behavior=ft.ClipBehavior.ANTI_ALIAS, border_radius=7, content=ft.Image(src=video.thumbnail, fit=ft.BoxFit.COVER, expand=True)),
+                ft.Container(width=160, aspect_ratio=16 / 9, clip_behavior=ft.ClipBehavior.ANTI_ALIAS, border_radius=7, content=thumbnail),
                 ft.Column(expand=True, spacing=5, controls=[
                     ft.Text(video.tags, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, weight=ft.FontWeight.W_600),
                     ft.Text(f"{video.width}×{video.height} · {format_duration(video.duration)} · {format_size(video.size)}", size=12, color=ft.Colors.BLUE_GREY_300),
@@ -460,6 +549,16 @@ async def main(page: ft.Page) -> None:
         nonlocal cancel_event, library_loaded
         if start.disabled:
             return
+        selected_method = getattr(download_video_settings, "method_dropdown", None)
+        if selected_method and selected_method.value == "direct":
+            await begin_direct_pexels_search()
+            return
+        if selected_method and selected_method.value != "api":
+            status.value = 'Chọn "Crawl by API" để tìm video bằng keyword.'
+            status.color = ft.Colors.AMBER_300
+            page.update()
+            return
+        video_preferences["method"] = "api"
         term = keyword.value.strip()
         selected_source = getattr(download_video_settings, "source_dropdown", None)
         source_name = ((selected_source.value if selected_source else None)
@@ -483,6 +582,7 @@ async def main(page: ft.Page) -> None:
             return
 
         start.disabled = True
+        pexels_link_button.disabled = True
         cancel_button.disabled = False
         cancel_event = Event()
         batch = database.batch()
@@ -494,6 +594,7 @@ async def main(page: ft.Page) -> None:
         grid.controls.clear()
         download_list.controls.clear()
         cards.clear()
+        thumbnail_slots.clear()
         download_videos.clear()
         selected_download.clear()
         download_select_controls.clear()
@@ -540,7 +641,7 @@ async def main(page: ft.Page) -> None:
                 batch.__exit__(None, None, None)
                 status.value = "Đã hủy." if cancel_event.is_set() else str(exc)
                 status.color = ft.Colors.AMBER_300 if cancel_event.is_set() else ft.Colors.RED_300
-                start.disabled = False
+                set_download_buttons_idle()
                 cancel_button.disabled = True
                 overall.visible = False
                 page.update()
@@ -550,7 +651,7 @@ async def main(page: ft.Page) -> None:
             batch.__exit__(None, None, None)
             status.value = str(exc)
             status.color = ft.Colors.RED_300
-            start.disabled = False
+            set_download_buttons_idle()
             cancel_button.disabled = True
             overall.visible = False
             page.update()
@@ -560,7 +661,7 @@ async def main(page: ft.Page) -> None:
             status.value = ("Đã hủy." if cancel_event.is_set() else
                             f"Không còn video mới phù hợp trên {source_name.title()} cho keyword này.")
             status.color = ft.Colors.AMBER_300
-            start.disabled = False
+            set_download_buttons_idle()
             cancel_button.disabled = True
             overall.visible = False
             page.update()
@@ -614,9 +715,357 @@ async def main(page: ft.Page) -> None:
             status.color = ft.Colors.RED_300
         finally:
             batch.__exit__(None, None, None)
-            start.disabled = False
+            set_download_buttons_idle()
             cancel_button.disabled = True
             overall.visible = False
+            update_download_selection()
+            page.update()
+
+    async def download_pexels_link(_: ft.ControlEvent) -> None:
+        nonlocal cancel_event, library_loaded
+        if pexels_link_button.disabled:
+            return
+        selected_method = getattr(download_video_settings, "method_dropdown", None)
+        if selected_method and selected_method.value != "direct":
+            status.value = 'Chọn "Crawl trực tiếp" để tải bằng link Pexels.'
+            status.color = ft.Colors.AMBER_300
+            page.update()
+            return
+        video_preferences["method"] = "direct"
+        selected_source = getattr(download_video_settings, "source_dropdown", None)
+        if selected_source and selected_source.value != "pexels":
+            status.value = "Crawl trực tiếp hiện chỉ hỗ trợ nguồn Pexels."
+            status.color = ft.Colors.AMBER_300
+            page.update()
+            return
+        try:
+            pexels_video_id(pexels_url.value or "")
+        except PexelsLinkError as exc:
+            status.value = str(exc)
+            status.color = ft.Colors.RED_300
+            page.update()
+            return
+
+        start.disabled = True
+        pexels_link_button.disabled = True
+        cancel_button.disabled = False
+        cancel_event = Event()
+        batch = database.batch()
+        owner = batch.__enter__()
+        overall.visible = True
+        overall.value = None
+        status.value = "Đang lấy liên kết tải chính thức từ Pexels..."
+        status.color = ft.Colors.BLUE_200
+        grid.controls.clear()
+        download_list.controls.clear()
+        cards.clear()
+        thumbnail_slots.clear()
+        download_videos.clear()
+        selected_download.clear()
+        download_select_controls.clear()
+        update_download_selection()
+        page.update()
+        video = None
+        try:
+            video = await asyncio.to_thread(resolve_pexels_video, pexels_url.value or "")
+            if cancel_event.is_set():
+                raise InterruptedError("Đã hủy tải.")
+            target = LIBRARY_ROOT / safe_folder_name(video.tags) / footage_filename(video)
+            reserved = await asyncio.to_thread(
+                database.reserve, video, video.tags, target, owner)
+            if not reserved:
+                status.value = "Video này đã có hoặc đang được tải trong Library."
+                status.color = ft.Colors.AMBER_300
+                return
+
+            download_videos[video.id] = video
+            grid.controls.append(card(video))
+            download_list.controls.append(list_item(video))
+            update_download_selection()
+            overall.value = 0
+            status.value = f"Đang tải video Pexels vào Library/{video.tags}..."
+            page.update()
+
+            queue: asyncio.Queue[DownloadEvent] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def report(event: DownloadEvent) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+
+            worker = asyncio.create_task(asyncio.to_thread(
+                download_many, [video], LIBRARY_ROOT, video.tags, cancel_event,
+                report, database, owner))
+            completed = 0
+            failed = 0
+            while not worker.done() or not queue.empty():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.15)
+                except TimeoutError:
+                    continue
+                for progress, label in cards[video.id]:
+                    progress.value = event.progress
+                    label.value = event.message
+                    label.color = {
+                        "done": ft.Colors.GREEN_300,
+                        "error": ft.Colors.RED_300,
+                        "cancelled": ft.Colors.AMBER_300,
+                    }.get(event.state, ft.Colors.BLUE_200)
+                if event.state in {"done", "error", "cancelled"}:
+                    completed += 1
+                    failed += event.state == "error"
+                    overall.value = completed
+                page.update()
+            await worker
+            if not failed and not cancel_event.is_set():
+                local_video = LIBRARY_ROOT / safe_folder_name(video.tags) / footage_filename(video)
+                try:
+                    actual_width, actual_height = await asyncio.to_thread(
+                        probe_video_dimensions, local_video)
+                except Exception:
+                    local_video.unlink(missing_ok=True)
+                    local_video.with_suffix(".jpg").unlink(missing_ok=True)
+                    local_video.with_suffix(".thumb.jpg").unlink(missing_ok=True)
+                    database.discard_completed_download(video.source, video.id)
+                    raise
+                if not orientation_matches(actual_width, actual_height,
+                                           video_preferences["orientation"]):
+                    local_video.unlink(missing_ok=True)
+                    local_video.with_suffix(".jpg").unlink(missing_ok=True)
+                    local_video.with_suffix(".thumb.jpg").unlink(missing_ok=True)
+                    database.discard_completed_download(video.source, video.id)
+                    grid.controls = [control for control in grid.controls
+                                     if control.data != video.id]
+                    download_list.controls = [control for control in download_list.controls
+                                              if control.data != video.id]
+                    for mapping in (cards, thumbnail_slots, download_select_controls,
+                                    download_videos):
+                        mapping.pop(video.id, None)
+                    status.value = (f"Downloaded video was removed because its actual orientation "
+                                    f"is {actual_width}x{actual_height}.")
+                    status.color = ft.Colors.AMBER_300
+                    return
+
+                verified = replace(video, width=actual_width, height=actual_height)
+                verified_path = local_video.with_name(footage_filename(verified))
+                if verified_path != local_video:
+                    if verified_path.exists():
+                        local_video.unlink(missing_ok=True)
+                        database.discard_completed_download(video.source, video.id)
+                        raise FileExistsError("Verified video filename already exists.")
+                    local_video.replace(verified_path)
+                    for suffix in (".jpg", ".thumb.jpg"):
+                        old_sidecar = local_video.with_suffix(suffix)
+                        if old_sidecar.exists():
+                            old_sidecar.replace(verified_path.with_suffix(suffix))
+                    local_video = verified_path
+                database.update_completed_video_metadata(verified, local_video)
+                video = verified
+                grid.controls = [control for control in grid.controls
+                                 if control.data != video.id]
+                download_list.controls = [control for control in download_list.controls
+                                          if control.data != video.id]
+                for mapping in (cards, thumbnail_slots, download_select_controls,
+                                download_videos):
+                    mapping.pop(video.id, None)
+                download_videos[video.id] = video
+                grid.controls.append(card(video))
+                download_list.controls.append(list_item(video))
+                for progress, label in cards[video.id]:
+                    progress.value = 1
+                    label.value = f"Verified: {actual_width}x{actual_height}"
+                    label.color = ft.Colors.GREEN_300
+                update_download_selection()
+            library_loaded = False
+            if not failed and not cancel_event.is_set():
+                local_video = LIBRARY_ROOT / safe_folder_name(video.tags) / footage_filename(video)
+                poster = await asyncio.to_thread(thumbnail_bytes, local_video)
+                if poster:
+                    for slot in thumbnail_slots.get(video.id, []):
+                        slot.content = ft.Image(src=poster, fit=ft.BoxFit.COVER, expand=True)
+            if cancel_event.is_set():
+                status.value = "Đã hủy tải. Video chưa hoàn tất đã được dọn khỏi Library."
+                status.color = ft.Colors.AMBER_300
+            elif failed:
+                status.value = "Tải video Pexels thất bại; bạn có thể thử lại bằng link này."
+                status.color = ft.Colors.RED_300
+            else:
+                status.value = f"Tải video Pexels hoàn tất: Library/{video.tags}"
+                status.color = ft.Colors.GREEN_300
+        except InterruptedError:
+            status.value = "Đã hủy tải."
+            status.color = ft.Colors.AMBER_300
+        except Exception as exc:
+            status.value = str(exc)
+            status.color = ft.Colors.RED_300
+        finally:
+            batch.__exit__(None, None, None)
+            set_download_buttons_idle()
+            cancel_button.disabled = True
+            overall.visible = False
+            update_download_selection()
+
+    async def begin_direct_pexels_search() -> None:
+        """Search public Pexels pages with Playwright, then download selected videos."""
+        nonlocal cancel_event, library_loaded
+        term = keyword.value.strip()
+        try:
+            count = int(amount.value)
+            if not term or not 1 <= count <= 200:
+                raise ValueError
+        except ValueError:
+            status.value = "Keyword không được trống; số lượng phải từ 1 đến 200."
+            status.color = ft.Colors.RED_300
+            page.update()
+            return
+
+        source_dropdown = getattr(download_video_settings, "source_dropdown", None)
+        if source_dropdown and source_dropdown.value != "pexels":
+            status.value = "Crawl trực tiếp chỉ hỗ trợ Pexels. Hãy chọn Pexels hoặc chuyển sang Crawl by API."
+            status.color = ft.Colors.AMBER_300
+            page.update()
+            return
+
+        video_preferences["method"] = "direct"
+        video_preferences["source"] = "pexels"
+        start.disabled = True
+        pexels_link_button.disabled = True
+        cancel_button.disabled = False
+        cancel_event = Event()
+        batch = database.batch()
+        owner = batch.__enter__()
+        overall.visible = True
+        overall.value = None
+        status.value = f"Đang tìm {count} video Pexels cho keyword “{term}” bằng Chrome..."
+        status.color = ft.Colors.BLUE_200
+        grid.controls.clear()
+        download_list.controls.clear()
+        cards.clear()
+        thumbnail_slots.clear()
+        download_videos.clear()
+        selected_download.clear()
+        download_select_controls.clear()
+        update_download_selection()
+        page.update()
+
+        try:
+            videos = await asyncio.to_thread(
+                search_pexels_videos_direct, term, count, cancel_event)
+            if cancel_event.is_set():
+                raise InterruptedError("Đã hủy tìm kiếm.")
+
+            candidates = videos
+            if not candidates:
+                status.value = "Pexels returned no downloadable video links for this keyword."
+                status.color = ft.Colors.AMBER_300
+                return
+
+            download_videos.update((video.id, video) for video in candidates)
+            grid.controls.extend(card(video) for video in candidates)
+            download_list.controls.extend(list_item(video) for video in candidates)
+            update_download_selection()
+            overall.value = 0
+            status.value = f"Downloaded candidates will be checked for {video_preferences['orientation']} orientation..."
+            page.update()
+
+            queue: asyncio.Queue[DownloadEvent] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def report(event: DownloadEvent) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+
+            worker = asyncio.create_task(asyncio.to_thread(
+                download_matching_pexels_videos, candidates, count, LIBRARY_ROOT, term,
+                video_preferences["orientation"], cancel_event, database, owner, report))
+            completed = 0
+            failed = 0
+            terminal_states = {"verified", "rejected", "error", "cancelled"}
+            while not worker.done() or not queue.empty():
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=0.15)
+                except TimeoutError:
+                    continue
+                for progress, label in cards[event.video_id]:
+                    progress.value = event.progress
+                    label.value = event.message
+                    label.color = {
+                        "done": ft.Colors.CYAN_300,
+                        "verified": ft.Colors.GREEN_300,
+                        "rejected": ft.Colors.AMBER_300,
+                        "error": ft.Colors.RED_300,
+                        "cancelled": ft.Colors.AMBER_300,
+                    }.get(event.state, ft.Colors.BLUE_200)
+                if event.state in terminal_states:
+                    completed += 1
+                    failed += event.state == "error"
+                    overall.value = min(1.0, completed / max(1, len(candidates)))
+                page.update()
+
+            selected_videos, attempted, rejected, skipped = await worker
+            overall.value = 1
+            valid_ids = {video.id for video in selected_videos}
+            grid.controls.clear()
+            download_list.controls.clear()
+            for mapping in (cards, thumbnail_slots, download_select_controls, download_videos):
+                mapping.clear()
+            download_videos.update((video.id, video) for video in selected_videos)
+            grid.controls.extend(card(video) for video in selected_videos)
+            download_list.controls.extend(list_item(video) for video in selected_videos)
+            for video in selected_videos:
+                for progress, label in cards[video.id]:
+                    progress.value = 1
+                    label.value = f"Verified: {video.width}x{video.height}"
+                    label.color = ft.Colors.GREEN_300
+            selected_download.intersection_update(valid_ids)
+            update_download_selection()
+
+            library_loaded = False
+            if not failed and not cancel_event.is_set():
+                for video in selected_videos:
+                    local_video = LIBRARY_ROOT / safe_folder_name(term) / footage_filename(video)
+                    poster = await asyncio.to_thread(thumbnail_bytes, local_video)
+                    if poster:
+                        for slot in thumbnail_slots.get(video.id, []):
+                            slot.content = ft.Image(src=poster, fit=ft.BoxFit.COVER, expand=True)
+            if current_view == "library":
+                await refresh_library(force=True)
+            if cancel_event.is_set():
+                status.value = f"Cancelled after retaining {len(selected_videos)} matching videos."
+                status.color = ft.Colors.AMBER_300
+            elif not selected_videos and skipped and not attempted:
+                status.value = "All discovered Pexels videos are already in the Library."
+                status.color = ft.Colors.AMBER_300
+            elif not selected_videos and rejected:
+                status.value = (f"No videos matched the selected orientation after checking {attempted} downloads; "
+                                f"{rejected} were discarded.")
+                status.color = ft.Colors.AMBER_300
+            elif failed:
+                status.value = (f"Kept {len(selected_videos)} matching videos; "
+                                f"{failed} candidate downloads failed.")
+                status.color = ft.Colors.AMBER_300
+            elif len(selected_videos) < count:
+                status.value = (f"Downloaded {len(selected_videos)}/{count} matching videos after checking "
+                                f"{attempted} downloads; more results may be unavailable or already saved.")
+                status.color = ft.Colors.AMBER_300
+            else:
+                status.value = f"Downloaded and verified {len(selected_videos)}/{count} Pexels videos."
+                status.color = ft.Colors.GREEN_300
+        except InterruptedError:
+            status.value = "Đã hủy tìm kiếm hoặc tải video."
+            status.color = ft.Colors.AMBER_300
+        except PexelsBrowserSearchError as exc:
+            status.value = str(exc)
+            status.color = ft.Colors.AMBER_300 if isinstance(exc, PexelsBrowserBlocked) else ft.Colors.RED_300
+        except (PexelsLinkError, OSError, sqlite3.Error) as exc:
+            status.value = str(exc)
+            status.color = ft.Colors.RED_300
+        except Exception as exc:
+            status.value = f"Lỗi khi tìm/tải Pexels: {exc}"
+            status.color = ft.Colors.RED_300
+        finally:
+            batch.__exit__(None, None, None)
+            overall.visible = False
+            set_download_buttons_idle()
+            cancel_button.disabled = True
             update_download_selection()
             page.update()
 
@@ -628,6 +1077,7 @@ async def main(page: ft.Page) -> None:
             page.update()
 
     start.on_click = begin_download
+    pexels_link_button.on_click = download_pexels_link
     cancel_button.on_click = cancel_download
     download_grid_button = ft.IconButton(icon=ft.Icons.GRID_VIEW, tooltip="Dạng lưới")
     download_list_button = ft.IconButton(icon=ft.Icons.FORMAT_LIST_BULLETED, tooltip="Dạng danh sách")
@@ -646,8 +1096,9 @@ async def main(page: ft.Page) -> None:
     download_view = ft.Column(expand=True, spacing=14, controls=[
             ft.Row([ft.Text("Stock Downloader", size=28, weight=ft.FontWeight.BOLD), ft.Row([download_grid_button, download_list_button], spacing=2)], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
             ft.Text("Tìm footage theo nguồn đã chọn và tải trực tiếp về máy.", color=ft.Colors.BLUE_GREY_300),
-            ft.Row([keyword, amount, start, cancel_button, resume_search], vertical_alignment=ft.CrossAxisAlignment.END),
             download_video_settings,
+            keyword_download_row,
+            pexels_direct_row,
             status,
             overall,
             ft.Divider(color="#263250"),
@@ -757,6 +1208,7 @@ async def main(page: ft.Page) -> None:
     library_progress = ft.ProgressBar(value=None, visible=False)
     library_action_status = ft.Text(size=12, color=ft.Colors.BLUE_GREY_300)
     library_records: dict[int, dict] = {}
+    library_deleted_records: set[tuple[int, str, float]] = set()
     library_visible_ids: set[int] = set()
     selected_library: set[int] = set()
     library_select_controls: dict[int, list[tuple[ft.IconButton, ft.Container]]] = {}
@@ -897,12 +1349,57 @@ async def main(page: ft.Page) -> None:
                                                        (grid_selector, grid_card)]
         update_library_selection()
 
+    def remove_library_results(record_ids: set[int]) -> None:
+        """Remove deleted cards in place without rebuilding every Library card."""
+        if not record_ids:
+            return
+        for record_id in record_ids:
+            library_records.pop(record_id, None)
+            library_visible_ids.discard(record_id)
+            selected_library.discard(record_id)
+            library_select_controls.pop(record_id, None)
+            LIBRARY_THUMBNAIL_CACHE.get(database, {}).pop(record_id, None)
+        library_list.controls[:] = [
+            control for control in library_list.controls
+            if getattr(control, "data", None) not in record_ids
+        ]
+        library_grid.controls[:] = [
+            control for control in library_grid.controls
+            if getattr(control, "data", None) not in record_ids
+        ]
+        query = (library_search.value or "").strip()
+        visible_count = sum(library_matches(record, query)
+                            for record in library_records.values())
+        library_count.value = (f"{visible_count}/{len(library_records)} video trong lịch sử"
+                               if query else f"{len(library_records)} video trong lịch sử")
+        if not library_records:
+            empty = "Library đang trống. Hãy tải video từ mục Download."
+            library_list.controls.append(ft.Text(empty, color=ft.Colors.BLUE_GREY_300))
+            library_grid.controls.append(ft.Text(empty, color=ft.Colors.BLUE_GREY_300))
+        elif query and not visible_count:
+            empty = f'Không tìm thấy video cho "{query}".'
+            library_list.controls.append(ft.Text(empty, color=ft.Colors.BLUE_GREY_300))
+            library_grid.controls.append(ft.Text(empty, color=ft.Colors.BLUE_GREY_300))
+        # Deleted cards are already gone, so refresh only toolbar state. Walking
+        # every remaining card here makes deletion slow for large libraries.
+        selected_library.intersection_update(library_records)
+        count = len(selected_library)
+        library_selected_count.value = f"{count} đã chọn"
+        visible_selected = selected_library & library_visible_ids
+        library_select_all.disabled = not library_visible_ids
+        library_select_all.icon = (ft.Icons.CHECK_BOX if (library_visible_ids and
+                                                           len(visible_selected) == len(library_visible_ids))
+                                   else ft.Icons.SELECT_ALL)
+        for button in (library_delete, library_save, library_move):
+            button.disabled = count == 0 or action_busy
+        page.update()
+
     def on_library_search(_: ft.ControlEvent) -> None:
         render_library_results()
 
     library_search.on_change = on_library_search
 
-    async def refresh_library(force: bool = False) -> None:
+    async def refresh_library(force: bool = False, reuse_thumbnails: bool = True) -> None:
         nonlocal library_loaded, library_task
         if library_task is not None:
             await library_task
@@ -917,9 +1414,21 @@ async def main(page: ft.Page) -> None:
             library_count.value = "Đang nạp thumbnail trong Library..."
             page.update()
             try:
+                if reuse_thumbnails:
+                    LIBRARY_THUMBNAIL_CACHE[database] = dict(library_records)
+                else:
+                    LIBRARY_THUMBNAIL_CACHE.pop(database, None)
                 records = await asyncio.to_thread(load_library_entries, database)
+                if library_deleted_records:
+                    records = [record for record in records
+                               if (record["id"], record["file_path"], record["created_at"])
+                               not in library_deleted_records]
+                LIBRARY_THUMBNAIL_CACHE[database] = {
+                    record["id"]: record for record in records
+                }
                 library_records.clear()
                 library_records.update((record["id"], record) for record in records)
+                library_deleted_records.clear()
                 library_loaded = True
                 render_library_results()
             except Exception as exc:
@@ -948,7 +1457,7 @@ async def main(page: ft.Page) -> None:
     library_list_button.on_click = lambda _: change_library_layout("list")
     library_grid_button.bgcolor = "#20335a"
     async def on_library_refresh(_: ft.ControlEvent) -> None:
-        await refresh_library(force=True)
+        await refresh_library(force=True, reuse_thumbnails=False)
 
     library_view = ft.Column(expand=True, spacing=12, controls=[
         ft.Row([library_grid_button, library_list_button], alignment=ft.MainAxisAlignment.END, spacing=2),
@@ -1476,7 +1985,7 @@ async def main(page: ft.Page) -> None:
             page.pop_dialog()
 
         async def confirm(_: ft.ControlEvent) -> None:
-            nonlocal library_loaded, project_loaded
+            nonlocal project_loaded
             page.pop_dialog()
             set_action_busy(True)
             action_message(section, "Đang xóa vĩnh viễn video...")
@@ -1498,14 +2007,14 @@ async def main(page: ft.Page) -> None:
                     download_select_controls.pop(video_id, None)
                     cards.pop(video_id, None)
                 selected_download.difference_update(discard)
-                selected_library.difference_update(removed_ids)
                 selected_project_videos.difference_update(removed_ids)
-                library_loaded = False
+                library_deleted_records.update(
+                    (row["id"], row["file_path"], row["created_at"])
+                    for row in records if row["id"] in removed_ids)
                 project_loaded = False
                 project_entry_cache.clear()
-                if current_view == "library":
-                    await refresh_library(force=True)
-                elif current_view == "project" and selected_project_id is not None:
+                remove_library_results(removed_ids)
+                if current_view == "project" and selected_project_id is not None:
                     await select_project(selected_project_id, selected_chapter_id, force_reload=True)
                 pending = len(ids) - len(records)
                 if pending and section == "download":

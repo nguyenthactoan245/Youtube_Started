@@ -24,42 +24,51 @@ def search_page(api_key: str, query: str, page: int = 1, per_page: int = 80,
                 quality: str = "2K", orientation: str = "landscape") -> tuple[list[Video], int]:
     if not api_key.strip():
         raise PexelsError("Hãy nhập Pexels API key trong Setup trước khi tải.")
-    params = {"query": query, "orientation": orientation, "per_page": min(80, max(1, per_page)),
-              "page": page}
+    params = {"query": query, "per_page": min(80, max(1, per_page)), "page": page}
+    if orientation in {"landscape", "portrait"}:
+        params["orientation"] = orientation
     size = {"HD": "small", "2K": "medium", "4K": "large"}.get(quality)
     if size:
         params["size"] = size
-    request = Request(f"{API_URL}?{urlencode(params)}",
-                      headers={"Authorization": api_key, "User-Agent": "StockDownloader/1.0"})
-    try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read())
-    except HTTPError as exc:
-        record(stage="pexels_search", **http_fields(exc.code, exc.headers))
-        if exc.code in (401, 403):
-            raise PexelsError("Pexels từ chối API key. Hãy kiểm tra key trong Setup.") from exc
-        if exc.code == 429:
-            raise PexelsError("Pexels API đang giới hạn request. Hãy chờ rồi thử lại.") from exc
-        raise PexelsError(f"Pexels trả về HTTP {exc.code}.") from exc
-    except (OSError, URLError, TimeoutError, json.JSONDecodeError) as exc:
-        record(stage="pexels_search", kind="network_error", error_type=type(exc).__name__)
-        raise PexelsError(f"Không thể kết nối Pexels: {type(exc).__name__}.") from exc
+    def fetch(key):
+        request = Request(f"{API_URL}?{urlencode(params)}",
+                          headers={"Authorization": key, "User-Agent": "StockDownloader/1.0"})
+        try:
+            with urlopen(request, timeout=30) as response:
+                return json.loads(response.read())
+        except HTTPError as exc:
+            record(stage="pexels_search", **http_fields(exc.code, exc.headers))
+            if exc.code in (401, 403):
+                raise PexelsError("Pexels từ chối API key. Hãy kiểm tra key trong Setup.") from exc
+            if exc.code == 429:
+                raise PexelsError("Pexels API đang giới hạn request. Hãy chờ quota được làm mới rồi thử lại.") from exc
+            raise PexelsError(f"Pexels trả về HTTP {exc.code}.") from exc
+        except (OSError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            record(stage="pexels_search", kind="network_error", error_type=type(exc).__name__)
+            raise PexelsError(f"Không thể kết nối Pexels: {type(exc).__name__}.") from exc
+
+    payload = fetch(api_key)
 
     videos = []
-    target_width = {"HD": 1280, "2K": 2560, "4K": 3840}.get(quality, 2560)
+    target_width = {"HD": 1280, "2K": 2560, "4K": 3840}.get(quality)
     for item in payload.get("videos", []):
         files = [file for file in item.get("video_files", [])
                  if file.get("file_type") == "video/mp4" and file.get("link")
                  and isinstance(file.get("width"), int) and isinstance(file.get("height"), int)]
         if orientation == "landscape":
-            files = [file for file in files if file["width"] >= file["height"]]
+            files = [file for file in files if file["width"] > file["height"]]
         elif orientation == "portrait":
             files = [file for file in files if file["height"] > file["width"]]
         if not files:
             continue
-        selected_file = min(files, key=lambda file: (
-            0 if file["width"] >= target_width else 1,
-            abs(file["width"] - target_width) if file["width"] >= target_width else -file["width"]))
+        if target_width is None:
+            selected_file = max(files, key=lambda file: file["width"] * file["height"])
+        else:
+            selected_file = min(files, key=lambda file: (
+                0 if max(file["width"], file["height"]) >= target_width else 1,
+                abs(max(file["width"], file["height"]) - target_width)
+                if max(file["width"], file["height"]) >= target_width
+                else -max(file["width"], file["height"])))
         user = item.get("user") or {}
         videos.append(Video(
             id=int(item["id"]), tags=str(item.get("alt") or query),

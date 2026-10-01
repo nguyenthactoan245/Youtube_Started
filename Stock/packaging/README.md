@@ -3,7 +3,8 @@
 Installer: `dist/Stock-Downloader-Setup-v1.9.1-x64.exe`.
 
 Run the installer, open Stock Downloader, and enter your Pixabay API key in **Setup**.
-The installer includes Python, the Flet desktop/video runtime, FFmpeg, and the app icon.
+The installer includes Python, the Flet desktop/video runtime, Playwright, FFmpeg, and the app icon.
+Google Chrome must already be installed for direct Pexels keyword search; Chrome itself is not bundled.
 It installs for the current user without administrator rights and provides an uninstaller.
 
 Installed app data lives in `%LOCALAPPDATA%\StockDownloader` (database, library,

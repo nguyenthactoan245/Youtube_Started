@@ -26,6 +26,8 @@ def build() -> None:
     for package in ("flet", "flet-desktop", "flet-video"):
         if importlib.metadata.version(package) != "0.85.3":
             raise RuntimeError(f"Install the pinned dependencies in requirements.txt: {package}")
+    if importlib.metadata.version("playwright") != "1.63.0":
+        raise RuntimeError("Install the pinned dependencies in requirements.txt: playwright")
     if not (args.client_dir / "flet.exe").is_file():
         raise FileNotFoundError("Flet 0.85.3 desktop runtime is missing; pass --client-dir")
     if not args.iscc.is_file():
@@ -33,6 +35,13 @@ def build() -> None:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise FileNotFoundError("FFmpeg is required on the build machine")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        sibling_ffprobe = Path(ffmpeg).resolve().with_name("ffprobe.exe")
+        if sibling_ffprobe.is_file():
+            ffprobe = str(sibling_ffprobe)
+        else:
+            raise FileNotFoundError("ffprobe is required on the build machine")
     ffmpeg_root = Path(ffmpeg).resolve().parent.parent
     for notice in ("LICENSE", "README.txt"):
         if not (ffmpeg_root / notice).is_file():
@@ -64,7 +73,8 @@ def build() -> None:
 
     notices = stage / "licenses"
     notices.mkdir(exist_ok=True)
-    for distribution in ("flet", "flet-desktop", "flet-video", "httpx", "httpcore", "anyio",
+    for distribution in ("flet", "flet-desktop", "flet-video", "playwright", "pyee", "greenlet",
+                         "httpx", "httpcore", "anyio",
                          "certifi", "idna", "h11", "msgpack", "oauthlib", "repath", "typing_extensions"):
         dist = importlib.metadata.distribution(distribution)
         for file in dist.files or []:
@@ -88,9 +98,11 @@ def build() -> None:
         "--add-data", f"{client};flet-client",
         "--add-data", f"{notices};licenses",
         "--add-data", f"{ffmpeg};ffmpeg",
+        "--add-data", f"{ffprobe};ffprobe",
         "--hidden-import", "flet_desktop", "--collect-all", "flet_video",
-        "--collect-data", "flet", "--collect-data", "certifi", "--copy-metadata", "flet",
-        "--copy-metadata", "flet-desktop", "--copy-metadata", "flet-video",
+        "--collect-all", "playwright", "--collect-data", "flet", "--collect-data", "certifi",
+        "--copy-metadata", "flet", "--copy-metadata", "flet-desktop", "--copy-metadata", "flet-video",
+        "--copy-metadata", "playwright",
     ])
     subprocess.run([str(args.iscc), str(ROOT / "packaging" / "installer.iss")], check=True)
     print(f"Built Stock Downloader v{APP_VERSION}")

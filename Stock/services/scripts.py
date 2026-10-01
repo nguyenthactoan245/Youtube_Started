@@ -70,6 +70,14 @@ def read_tracker(path: Path) -> dict:
     if any(len(row) > len(headers) for row in rows[1:]):
         raise ValueError("Có dữ liệu nằm ngoài các cột tiêu đề.")
     data_rows = [row + [""] * (len(headers) - len(row)) for row in rows[1:]]
+    # Store requested scene durations consistently as one decimal place on import.
+    if "Duration (s)" in headers:
+        duration_column = headers.index("Duration (s)")
+        for row in data_rows:
+            try:
+                row[duration_column] = f"{float(row[duration_column]):.1f}"
+            except (TypeError, ValueError):
+                pass
     if alaska:
         # Keep every source field visible while supplying the canonical fields used by Script actions.
         mapping = {
