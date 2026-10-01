@@ -343,7 +343,10 @@ async def main(page: ft.Page) -> None:
     resume_search = ft.OutlinedButton("Tiếp tục tìm kiếm", visible=False,
                                      on_click=lambda _: get_api_key_pool().resume())
     status = ft.Text("Nhập keyword và số lượng video cần tải.", color=ft.Colors.BLUE_200)
-    overall = ft.ProgressBar(value=0, visible=False)
+    overall = ft.ProgressBar(value=0, visible=False, expand=True)
+    overall_count = ft.Text("", size=12, color=ft.Colors.BLUE_GREY_300, visible=False)
+    download_progress = ft.Row([overall, overall_count], spacing=12,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER)
     grid = ft.GridView(expand=True, max_extent=350, child_aspect_ratio=0.95, spacing=14, run_spacing=14)
     download_list = ft.ListView(expand=True, spacing=8)
     download_results = ft.Container(expand=True, content=grid)
@@ -948,35 +951,47 @@ async def main(page: ft.Page) -> None:
         page.update()
 
         try:
-            videos = await asyncio.to_thread(
-                search_pexels_videos_direct, term, count, cancel_event)
-            if cancel_event.is_set():
-                raise InterruptedError("Đã hủy tìm kiếm.")
-
-            candidates = videos
-            if not candidates:
-                status.value = "Pexels returned no downloadable video links for this keyword."
-                status.color = ft.Colors.AMBER_300
-                return
-
-            download_videos.update((video.id, video) for video in candidates)
-            grid.controls.extend(card(video) for video in candidates)
-            download_list.controls.extend(list_item(video) for video in candidates)
-            update_download_selection()
             overall.value = 0
-            status.value = f"Downloaded candidates will be checked for {video_preferences['orientation']} orientation..."
+            overall_count.value = f"0/{count} đạt"
+            overall_count.visible = True
+            status.value = (f"Searching and checking Pexels results until {count} videos match "
+                            f"{video_preferences['orientation']} orientation...")
             page.update()
-
             queue: asyncio.Queue[DownloadEvent] = asyncio.Queue()
             loop = asyncio.get_running_loop()
 
             def report(event: DownloadEvent) -> None:
                 loop.call_soon_threadsafe(queue.put_nowait, event)
 
-            worker = asyncio.create_task(asyncio.to_thread(
-                download_matching_pexels_videos, candidates, count, LIBRARY_ROOT, term,
-                video_preferences["orientation"], cancel_event, database, owner, report))
-            completed = 0
+            accepted_videos: list[Video] = []
+            attempted_ids: set[int] = set()
+            attempted = rejected = skipped = 0
+
+            def process_candidate_batch(candidates: list[Video]) -> bool:
+                nonlocal attempted, rejected, skipped
+                fresh = [candidate for candidate in candidates
+                         if candidate.id not in attempted_ids]
+                attempted_ids.update(candidate.id for candidate in fresh)
+                if not fresh or cancel_event.is_set():
+                    return cancel_event.is_set()
+                accepted, tried, discarded, existing = download_matching_pexels_videos(
+                    fresh, count - len(accepted_videos), LIBRARY_ROOT, term,
+                    video_preferences["orientation"], cancel_event, database, owner, report)
+                accepted_videos.extend(accepted)
+                attempted += tried
+                rejected += discarded
+                skipped += existing
+                return cancel_event.is_set() or len(accepted_videos) >= count
+
+            def search_and_download():
+                search_pexels_videos_direct(
+                    term, count, cancel_event, exclude_ids=attempted_ids,
+                    on_batch=process_candidate_batch,
+                )
+                return accepted_videos, attempted, rejected, skipped
+
+            worker = asyncio.create_task(asyncio.to_thread(search_and_download))
+            verified_count = 0
             failed = 0
             terminal_states = {"verified", "rejected", "error", "cancelled"}
             while not worker.done() or not queue.empty():
@@ -984,7 +999,7 @@ async def main(page: ft.Page) -> None:
                     event = await asyncio.wait_for(queue.get(), timeout=0.15)
                 except TimeoutError:
                     continue
-                for progress, label in cards[event.video_id]:
+                for progress, label in cards.get(event.video_id, []):
                     progress.value = event.progress
                     label.value = event.message
                     label.color = {
@@ -995,13 +1010,17 @@ async def main(page: ft.Page) -> None:
                         "cancelled": ft.Colors.AMBER_300,
                     }.get(event.state, ft.Colors.BLUE_200)
                 if event.state in terminal_states:
-                    completed += 1
                     failed += event.state == "error"
-                    overall.value = min(1.0, completed / max(1, len(candidates)))
+                if event.state == "verified":
+                    verified_count += 1
+                    overall.value = min(1.0, verified_count / count)
+                    overall_count.value = f"{verified_count}/{count} đạt"
+                status.value = event.message
                 page.update()
 
             selected_videos, attempted, rejected, skipped = await worker
-            overall.value = 1
+            overall.value = min(1.0, len(selected_videos) / count)
+            overall_count.value = f"{len(selected_videos)}/{count} đạt"
             valid_ids = {video.id for video in selected_videos}
             grid.controls.clear()
             download_list.controls.clear()
@@ -1064,6 +1083,7 @@ async def main(page: ft.Page) -> None:
         finally:
             batch.__exit__(None, None, None)
             overall.visible = False
+            overall_count.visible = False
             set_download_buttons_idle()
             cancel_button.disabled = True
             update_download_selection()
@@ -1100,7 +1120,7 @@ async def main(page: ft.Page) -> None:
             keyword_download_row,
             pexels_direct_row,
             status,
-            overall,
+            download_progress,
             ft.Divider(color="#263250"),
             ft.Row([download_select_all, download_selected_count, download_delete,
                     download_save, download_move], spacing=4),
