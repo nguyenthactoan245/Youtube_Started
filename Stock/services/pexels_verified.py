@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -73,7 +74,7 @@ def orientation_matches(width: int, height: int, orientation: str) -> bool:
 def download_matching_pexels_videos(
     videos: list[Video], amount: int, root: Path, keyword: str, orientation: str,
     cancel: Event, database: VideoDatabase, owner: str,
-    report: Callable[[DownloadEvent], None],
+    report: Callable[[DownloadEvent], None], workers: int = 3,
 ) -> tuple[list[Video], int, int, int]:
     """Try candidates sequentially until enough downloaded files match orientation."""
     ffprobe = find_ffprobe()
@@ -81,16 +82,27 @@ def download_matching_pexels_videos(
     accepted: list[Video] = []
     attempted = rejected = skipped = 0
 
+    pending: list[tuple[Video, Path]] = []
     for candidate in videos:
-        if cancel.is_set() or len(accepted) >= amount:
+        if cancel.is_set():
             break
         target = destination / footage_filename(candidate)
         if not database.reserve(candidate, keyword, target, owner):
             skipped += 1
             continue
-
         attempted += 1
-        download_many([candidate], Path(root), keyword, cancel, report, database, owner)
+        pending.append((candidate, target))
+
+    with ThreadPoolExecutor(max_workers=min(max(1, workers), max(1, len(pending)))) as executor:
+        futures = {executor.submit(download_many, [candidate], Path(root), keyword,
+                                     cancel, report, database, owner): (candidate, target)
+                   for candidate, target in pending}
+        for future in futures:
+            future.result()
+
+    for candidate, target in pending:
+        if cancel.is_set() or len(accepted) >= amount:
+            break
         if cancel.is_set() or not target.is_file():
             continue
 

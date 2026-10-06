@@ -1001,7 +1001,8 @@ async def main(page: ft.Page) -> None:
                     return cancel_event.is_set()
                 accepted, tried, discarded, existing = download_matching_pexels_videos(
                     fresh, per_keyword_count - len(active_term_videos), LIBRARY_ROOT, active_term,
-                    video_preferences["orientation"], cancel_event, database, owner, report)
+                    video_preferences["orientation"], cancel_event, database, owner, report,
+                    workers=max(1, min(20, int(video_preferences.get("workers", "5")))))
                 accepted_videos.extend(accepted)
                 active_term_videos.extend(accepted)
                 attempted += tried
