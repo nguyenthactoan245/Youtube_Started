@@ -6,7 +6,7 @@ import re
 import sys
 from pathlib import Path
 
-APP_VERSION = "1.9.1"
+APP_VERSION = "1.10.1"
 RESOURCE_ROOT = Path(__file__).resolve().parent
 
 

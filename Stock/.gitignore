@@ -1,6 +1,7 @@
 .env
 downloads/
 library/
+edits/
 data/
 __pycache__/
 services/__pycache__/
@@ -12,3 +13,9 @@ build/
 dist/
 # Local diagnostic history
 logs/
+
+# Local databases and SQLite sidecar files
+*.db
+*.db-*
+*.sqlite
+*.sqlite3

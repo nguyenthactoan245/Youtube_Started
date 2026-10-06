@@ -1,4 +1,4 @@
-#define AppVersion "1.9.1"
+#define AppVersion "1.10.1"
 #define AppName "Stock Downloader"
 
 [Setup]
@@ -6,7 +6,7 @@ AppId={{D5999937-BCB4-4574-883C-08DA0938D788}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} v{#AppVersion}
-VersionInfoVersion=1.9.1.0
+VersionInfoVersion=1.10.1.0
 DefaultDirName={localappdata}\Programs\Stock Downloader
 DefaultGroupName={#AppName}
 PrivilegesRequired=lowest

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import shutil
 import subprocess
 import sys
@@ -11,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from services.video_trim import trim_video
+from services.video_trim import trim_random_video, trim_video
 
 
 class VideoTrimTests(unittest.TestCase):
@@ -50,6 +51,25 @@ class VideoTrimTests(unittest.TestCase):
         with patch("services.video_trim.shutil.which", side_effect=[ffmpeg, ffprobe]):
             with self.assertRaisesRegex(ValueError, "requested segment"):
                 trim_video(source, self.folder / "too-long.mp4", 2.0)
+
+    def test_random_trim_writes_one_clip_inside_requested_range(self):
+        ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+        if not ffmpeg or not ffprobe:
+            self.skipTest("FFmpeg and ffprobe are required")
+        source, output = self.folder / "random-source.mp4", self.folder / "random-trim.mp4"
+        subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                        "-i", "testsrc=size=160x90:rate=25:duration=8", "-c:v", "libx264",
+                        "-pix_fmt", "yuv420p", "-y", str(source)], check=True, capture_output=True)
+        with patch("services.video_trim.shutil.which", side_effect=[ffmpeg, ffprobe]):
+            result, start, duration = trim_random_video(
+                source, output, 2.0, 3.0, random.Random(7))
+        self.assertEqual(result, output)
+        self.assertTrue(output.is_file())
+        self.assertGreaterEqual(duration, 2.0)
+        self.assertLessEqual(duration, 3.0)
+        self.assertEqual(duration * 10, round(duration * 10))
+        self.assertGreaterEqual(start, 0.0)
+        self.assertLessEqual(start + duration, 8.05)
 
 
 if __name__ == "__main__":

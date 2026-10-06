@@ -33,6 +33,30 @@ def export_videos(paths: list[Path], destination: Path) -> tuple[int, int]:
     return copied, skipped
 
 
+def export_named_videos(paths: list[Path], names: list[str], destination: Path) -> tuple[int, int]:
+    """Copy videos using matching requested filenames, without overwriting."""
+    if not destination.is_dir():
+        raise ValueError("Thư mục đích không tồn tại.")
+    copied = skipped = 0
+    for path, requested in zip(paths, names):
+        if not path.is_file():
+            skipped += 1
+            continue
+        target = destination / Path(requested).name
+        try:
+            with path.open("rb") as source, target.open("xb") as output:
+                try:
+                    shutil.copyfileobj(source, output, 1024 * 1024)
+                except Exception:
+                    output.close()
+                    target.unlink(missing_ok=True)
+                    raise
+            copied += 1
+        except FileExistsError:
+            skipped += 1
+    return copied, skipped
+
+
 def export_videos_zip(paths: list[Path], destination: Path,
                       names: list[str] | None = None) -> tuple[int, int]:
     """Create a new ZIP archive, optionally using one requested name per video."""

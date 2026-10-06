@@ -11,7 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models import Video
-from services.assets import delete_videos, export_videos, export_videos_zip
+from services.assets import delete_videos, export_named_videos, export_videos, export_videos_zip
 from services.database import VideoDatabase
 
 
@@ -54,6 +54,17 @@ class AssetTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             export_videos_zip([first, second], archive)
         self.assertEqual(first.read_bytes(), b"first video")
+
+    def test_export_named_videos_preserves_requested_order_prefixes(self):
+        first, second = self.library / "first.mp4", self.library / "second.mp4"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        target = self.root / "ordered"
+        target.mkdir()
+        self.assertEqual(export_named_videos(
+            [second, first], ["01_second.mp4", "02_first.mp4"], target), (2, 0))
+        self.assertEqual((target / "01_second.mp4").read_bytes(), b"second")
+        self.assertEqual((target / "02_first.mp4").read_bytes(), b"first")
 
     def test_export_zip_uses_visual_beat_names(self):
         source = self.library / "302122_2560x1440.mp4"

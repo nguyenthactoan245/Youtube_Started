@@ -15,6 +15,20 @@ def select_unique(api_key: str, keyword: str, amount: int, root: Path,
                   database: VideoDatabase, owner: str, cancel: Event,
                   exclude_ids: set[int] | None = None, quality: str = "2K",
                   orientation: str = "landscape", filename_prefix: str = "") -> list[Video]:
+    keywords = [part.strip() for part in keyword.split(",") if part.strip()]
+    if len(keywords) > 1:
+        combined: list[Video] = []
+        seen = set(exclude_ids or ())
+        for term in keywords:
+            if cancel.is_set():
+                break
+            found = select_unique(api_key, term, amount, root, database, owner, cancel,
+                                  exclude_ids=seen, quality=quality, orientation=orientation,
+                                  filename_prefix=filename_prefix)
+            combined.extend(found)
+            seen.update(video.id for video in found)
+        return combined
+    keyword = keywords[0] if keywords else keyword.strip()
     selected: list[Video] = []
     seen: set[int] = set(exclude_ids or ())
     page = 1

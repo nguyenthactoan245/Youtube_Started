@@ -68,6 +68,27 @@ class VideoDatabase:
                     chapter_id INTEGER REFERENCES chapters(id),
                     assigned_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS edit_videos (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    chapter_id INTEGER,
+                    video_record_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    added_at REAL NOT NULL,
+                    trimmed_path TEXT NOT NULL DEFAULT '',
+                    trim_start REAL,
+                    trim_duration REAL,
+                    trim_status TEXT NOT NULL DEFAULT '',
+                    trim_error TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS ordered_videos (
+                    id INTEGER PRIMARY KEY,
+                    project_id INTEGER NOT NULL,
+                    chapter_id INTEGER,
+                    video_record_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    UNIQUE(project_id, chapter_id, video_record_id)
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(videos)")}
             if "hidden_at" not in columns:
@@ -94,6 +115,24 @@ class VideoDatabase:
                 ON video_placements(video_record_id, project_id, COALESCE(chapter_id, 0))""")
             db.execute("""CREATE INDEX IF NOT EXISTS video_placements_project_chapter
                 ON video_placements(project_id, chapter_id)""")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS edit_videos_unique_target
+                ON edit_videos(project_id, COALESCE(chapter_id, 0), video_record_id)""")
+            db.execute("""CREATE INDEX IF NOT EXISTS edit_videos_project_chapter_position
+                ON edit_videos(project_id, chapter_id, position)""")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS ordered_videos_unique_target
+                ON ordered_videos(project_id, COALESCE(chapter_id, 0), video_record_id)""")
+            db.execute("""CREATE INDEX IF NOT EXISTS ordered_videos_scope_position
+                ON ordered_videos(project_id, chapter_id, position)""")
+            edit_columns = {row[1] for row in db.execute("PRAGMA table_info(edit_videos)")}
+            for name, definition in (
+                ("trimmed_path", "TEXT NOT NULL DEFAULT ''"),
+                ("trim_start", "REAL"),
+                ("trim_duration", "REAL"),
+                ("trim_status", "TEXT NOT NULL DEFAULT ''"),
+                ("trim_error", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in edit_columns:
+                    db.execute(f"ALTER TABLE edit_videos ADD COLUMN {name} {definition}")
 
     @contextmanager
     def connect(self):
@@ -222,6 +261,8 @@ class VideoDatabase:
             if row is None:
                 return False
             db.execute("DELETE FROM video_placements WHERE video_record_id=?", (row["id"],))
+            db.execute("DELETE FROM edit_videos WHERE video_record_id=?", (row["id"],))
+            db.execute("DELETE FROM ordered_videos WHERE video_record_id=?", (row["id"],))
             db.execute("DELETE FROM videos WHERE id=?", (row["id"],))
             return True
 
@@ -245,6 +286,23 @@ class VideoDatabase:
                     AND status IN ('completed','review') AND hidden_at IS NULL""", chunk).fetchall())
         return [dict(row) for row in rows]
 
+    def source_video_records(self, source_ids: list[tuple[str, int]]) -> list[dict]:
+        """Return completed records identified by their provider and provider video ID."""
+        grouped: dict[str, list[int]] = {}
+        for source, video_id in source_ids:
+            grouped.setdefault(source, []).append(video_id)
+        rows = []
+        with self.connect() as db:
+            for source, ids in grouped.items():
+                for offset in range(0, len(ids), 500):
+                    chunk = ids[offset:offset + 500]
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows.extend(db.execute(f"""SELECT * FROM videos
+                        WHERE source=? AND video_id IN ({placeholders})
+                        AND status IN ('completed','review') AND hidden_at IS NULL""",
+                                           [source, *chunk]).fetchall())
+        return [dict(row) for row in rows]
+
     def delete_video(self, record_id: int) -> bool:
         """Remove a completed video and its placement so its Pixabay ID can be reused."""
         with self.connect() as db:
@@ -253,6 +311,8 @@ class VideoDatabase:
             if row is None or row["status"] not in ("completed", "review"):
                 return False
             db.execute("DELETE FROM video_placements WHERE video_record_id=?", (record_id,))
+            db.execute("DELETE FROM edit_videos WHERE video_record_id=?", (record_id,))
+            db.execute("DELETE FROM ordered_videos WHERE video_record_id=?", (record_id,))
             db.execute("DELETE FROM videos WHERE id=?", (record_id,))
         return True
 
@@ -299,6 +359,115 @@ class VideoDatabase:
                 WHERE p.project_id=? AND v.hidden_at IS NULL
                 ORDER BY p.assigned_at, v.id""", (project_id,)).fetchall()
         return [dict(row, details=json.loads(row["metadata"])) for row in rows]
+
+    def list_edit_video_ids(self, project_id: int, chapter_id: int | None = None) -> list[int]:
+        with self.connect() as db:
+            rows = db.execute("""SELECT video_record_id FROM edit_videos
+                WHERE project_id=? AND chapter_id IS ? ORDER BY position, id""",
+                              (project_id, chapter_id)).fetchall()
+        return [row["video_record_id"] for row in rows]
+
+    def list_edit_videos(self, project_id: int, chapter_id: int | None = None) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute("""SELECT video_record_id, position, trimmed_path, trim_start,
+                trim_duration, trim_status, trim_error FROM edit_videos
+                WHERE project_id=? AND chapter_id IS ? ORDER BY position, id""",
+                              (project_id, chapter_id)).fetchall()
+        return [dict(row) for row in rows]
+
+    def save_edit_trim(self, record_id: int, project_id: int, chapter_id: int | None,
+                       path: Path, start: float, duration: float) -> None:
+        with self.connect() as db:
+            cursor = db.execute("""UPDATE edit_videos SET trimmed_path=?, trim_start=?,
+                trim_duration=?, trim_status='completed', trim_error=''
+                WHERE project_id=? AND chapter_id IS ? AND video_record_id=?""",
+                                (str(Path(path).resolve()), start, duration,
+                                 project_id, chapter_id, record_id))
+            if cursor.rowcount != 1:
+                raise ValueError("Video không còn trong danh sách Edit.")
+
+    def save_edit_trim_error(self, record_id: int, project_id: int,
+                             chapter_id: int | None, error: str) -> None:
+        with self.connect() as db:
+            db.execute("""UPDATE edit_videos SET trim_status='failed', trim_error=?
+                WHERE project_id=? AND chapter_id IS ? AND video_record_id=?""",
+                       (error[:500], project_id, chapter_id, record_id))
+
+    def list_ordered_video_ids(self, project_id: int, chapter_id: int | None = None) -> list[int]:
+        with self.connect() as db:
+            rows = db.execute("""SELECT video_record_id FROM ordered_videos
+                WHERE project_id=? AND chapter_id IS ? ORDER BY position, id""",
+                              (project_id, chapter_id)).fetchall()
+        return [row["video_record_id"] for row in rows]
+
+    def save_ordered_video_ids(self, record_ids: list[int], project_id: int,
+                               chapter_id: int | None = None) -> None:
+        record_ids = list(dict.fromkeys(record_ids))
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            available = {row[0] for row in db.execute("""SELECT video_record_id FROM edit_videos
+                WHERE project_id=? AND chapter_id IS ? AND trim_status='completed'
+                AND trimmed_path<>''""", (project_id, chapter_id))}
+            if not set(record_ids).issubset(available):
+                raise ValueError("Có video trim không còn tồn tại trong chapter.")
+            db.execute("DELETE FROM ordered_videos WHERE project_id=? AND chapter_id IS ?",
+                       (project_id, chapter_id))
+            db.executemany("""INSERT INTO ordered_videos
+                (project_id, chapter_id, video_record_id, position) VALUES (?, ?, ?, ?)""",
+                           [(project_id, chapter_id, record_id, position)
+                            for position, record_id in enumerate(record_ids, 1)])
+
+    def add_edit_videos(self, record_ids: list[int], project_id: int,
+                        chapter_id: int | None = None) -> int:
+        if not record_ids:
+            return 0
+        record_ids = list(dict.fromkeys(record_ids))
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                raise ValueError("Project không còn tồn tại.")
+            if chapter_id is not None and not db.execute(
+                "SELECT 1 FROM chapters WHERE id=? AND project_id=?", (chapter_id, project_id)
+            ).fetchone():
+                raise ValueError("Chapter không thuộc project đã chọn.")
+            placeholders = ",".join("?" for _ in record_ids)
+            valid = {row[0] for row in db.execute(
+                f"""SELECT id FROM videos WHERE id IN ({placeholders})
+                    AND status IN ('completed','review') AND hidden_at IS NULL""", record_ids)}
+            if len(valid) != len(record_ids):
+                raise ValueError("Có video không còn trong Library.")
+            position = db.execute("""SELECT COALESCE(MAX(position), 0) FROM edit_videos
+                WHERE project_id=? AND chapter_id IS ?""", (project_id, chapter_id)).fetchone()[0]
+            now = time.time()
+            inserted = 0
+            for record_id in record_ids:
+                position += 1
+                cursor = db.execute("""INSERT OR IGNORE INTO edit_videos
+                    (project_id, chapter_id, video_record_id, position, added_at)
+                    VALUES (?, ?, ?, ?, ?)""",
+                                    (project_id, chapter_id, record_id, position, now))
+                inserted += cursor.rowcount
+        return inserted
+
+    def remove_edit_videos(self, record_ids: list[int], project_id: int,
+                           chapter_id: int | None = None) -> int:
+        if not record_ids:
+            return 0
+        removed = 0
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for offset in range(0, len(record_ids), 500):
+                chunk = record_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                db.execute(f"""DELETE FROM ordered_videos
+                    WHERE project_id=? AND chapter_id IS ?
+                    AND video_record_id IN ({placeholders})""",
+                           [project_id, chapter_id, *chunk])
+                removed += db.execute(f"""DELETE FROM edit_videos
+                    WHERE project_id=? AND chapter_id IS ?
+                    AND video_record_id IN ({placeholders})""",
+                                      [project_id, chapter_id, *chunk]).rowcount
+        return removed
 
     def create_project(self, name: str) -> int:
         name = name.strip()
@@ -361,6 +530,10 @@ class VideoDatabase:
             )""", (project_id, chapter_id))
             db.execute("""UPDATE video_placements SET chapter_id=NULL
                 WHERE project_id=? AND chapter_id=?""", (project_id, chapter_id))
+            db.execute("DELETE FROM edit_videos WHERE project_id=? AND chapter_id=?",
+                       (project_id, chapter_id))
+            db.execute("DELETE FROM ordered_videos WHERE project_id=? AND chapter_id=?",
+                       (project_id, chapter_id))
             db.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
         return affected
 
@@ -372,6 +545,8 @@ class VideoDatabase:
                 raise ValueError("Project không còn tồn tại.")
             unassigned = db.execute("DELETE FROM video_placements WHERE project_id=?",
                                     (project_id,)).rowcount
+            db.execute("DELETE FROM edit_videos WHERE project_id=?", (project_id,))
+            db.execute("DELETE FROM ordered_videos WHERE project_id=?", (project_id,))
             db.execute("DELETE FROM chapters WHERE project_id=?", (project_id,))
             db.execute("DELETE FROM projects WHERE id=?", (project_id,))
         return unassigned

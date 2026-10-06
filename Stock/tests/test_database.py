@@ -114,6 +114,8 @@ class DatabaseTests(unittest.TestCase):
             sources = {row["source"] for row in connection.execute(
                 "SELECT source FROM videos WHERE video_id=7").fetchall()}
         self.assertEqual(sources, {"pixabay", "pexels"})
+        records = self.db.source_video_records([("pexels", 7)])
+        self.assertEqual([(row["source"], row["video_id"]) for row in records], [("pexels", 7)])
 
     def test_import_preserves_legacy_files_and_unknown_names(self):
         old = self.root / 'downloads' / 'Moscow'
@@ -309,6 +311,38 @@ class DatabaseTests(unittest.TestCase):
         with self.db.connect() as connection:
             row = connection.execute('SELECT hidden_at FROM videos WHERE video_id=53').fetchone()
         self.assertIsNone(row['hidden_at'])
+
+    def test_edit_video_list_persists_per_chapter(self):
+        files = []
+        for video_id in (81, 82):
+            file = self.library / 'Edit' / f'{video_id}_1280x720.mp4'
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b'video')
+            files.append(file)
+        self.db.import_existing(self.library, self.root / 'downloads')
+        project_id = self.db.create_project('Persistent edit')
+        chapter_id = self.db.create_chapter(project_id, 'Chapter')
+        record_ids = [row['id'] for row in reversed(self.db.library())]
+        self.db.assign_videos(record_ids, project_id, chapter_id)
+        self.assertEqual(self.db.add_edit_videos(record_ids, project_id, chapter_id), 2)
+        self.assertEqual(self.db.add_edit_videos(record_ids, project_id, chapter_id), 0)
+
+        reopened = VideoDatabase(self.db.path)
+        self.assertEqual(reopened.list_edit_video_ids(project_id, chapter_id), record_ids)
+        trimmed = self.root / 'edits' / 'trimmed.mp4'
+        trimmed.parent.mkdir(parents=True)
+        trimmed.write_bytes(b'trimmed')
+        reopened.save_edit_trim(record_ids[0], project_id, chapter_id, trimmed, 3.2, 5.7)
+        reopened.save_edit_trim(record_ids[1], project_id, chapter_id, trimmed, 1.1, 5.2)
+        trim_row = reopened.list_edit_videos(project_id, chapter_id)[0]
+        self.assertEqual(Path(trim_row['trimmed_path']), trimmed.resolve())
+        self.assertEqual((trim_row['trim_start'], trim_row['trim_duration']), (3.2, 5.7))
+        reopened.save_ordered_video_ids(record_ids, project_id, chapter_id)
+        self.assertEqual(VideoDatabase(self.db.path).list_ordered_video_ids(project_id, chapter_id),
+                         record_ids)
+        self.assertEqual(reopened.remove_edit_videos([record_ids[0]], project_id, chapter_id), 1)
+        self.assertEqual(reopened.list_edit_video_ids(project_id, chapter_id), [record_ids[1]])
+        self.assertEqual(reopened.list_ordered_video_ids(project_id, chapter_id), [record_ids[1]])
 
     def test_existing_database_migrates_hidden_at(self):
         old = self.root / 'old.db'
@@ -514,7 +548,12 @@ class DatabaseTests(unittest.TestCase):
             asyncio.run(sidebar[4].on_click(None))
             project_list = project_view.controls[0].content.controls[-1]
             detail = project_view.controls[2].content.controls
-            project_grid = detail[-1]
+            chapter_tabs = detail[-1]
+            self.assertEqual([tab.label for tab in chapter_tabs.content.controls[0].tabs],
+                             ["Video stock", "Trim Video", "Order Video"])
+            self.assertFalse(chapter_tabs.content.controls[0].tabs[2].disabled)
+            stock_tab = chapter_tabs.content.controls[1].controls[0]
+            project_grid = stock_tab.controls[-1]
             self.assertEqual({card.data for card in project_grid.controls}, set(record_ids.values()))
             self.assertEqual(len(project_grid.controls), 2)
             project_item = project_list.controls[0]
@@ -583,10 +622,62 @@ class DatabaseTests(unittest.TestCase):
             project_view = page.controls[0].controls[2].content.controls[3].content
             asyncio.run(sidebar[4].on_click(None))
             detail = project_view.controls[2].content.controls
-            select_all, count, delete, export, move = detail[-4].controls
+            stock_tab = detail[-1].content.controls[1].controls[0]
+            select_all, count, delete, export, move, add_stock = stock_tab.controls[0].controls
             self.assertEqual(count.value, '0 đã chọn')
             select_all.on_click(None)
             self.assertEqual(count.value, '2 đã chọn')
+            edit_tab = detail[-1].content.controls[1].controls[1]
+            asyncio.run(add_stock.on_click(None))
+            self.assertEqual(page.dialog.title, 'Trim video ngẫu nhiên')
+            duration_fields = page.dialog.content.content.controls[1].controls
+            self.assertEqual([field.value for field in duration_fields], ['5,0', '6,0'])
+
+            def fake_trim(source, destination, minimum, maximum):
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b'trimmed')
+                return destination, 1.5, 5.5
+
+            with patch.object(main, 'trim_random_video', side_effect=fake_trim), \
+                 patch.object(main, 'thumbnail_bytes', return_value=b'poster'):
+                asyncio.run(page.dialog.actions[1].on_click(None))
+            self.assertEqual(len(edit_tab.controls[-1].controls), 2)
+            edit_select_all, edit_count, edit_delete = edit_tab.controls[0].controls
+            self.assertEqual(edit_tab.controls[1].value, 'Trim hoàn tất: 2 thành công, 0 lỗi.')
+            self.assertEqual(detail[-1].selected_index, 1)
+            order_tab = detail[-1].content.controls[1].controls[2]
+            order_row = order_tab.controls[2]
+            pool_target = order_row.controls[0].content
+            pool = pool_target.content.controls[1]
+            ordered_list = order_row.controls[2].content.controls[1]
+            self.assertEqual(len(pool.controls), 2)
+            pool_card_row = pool.controls[0].content.content
+            self.assertEqual(len(pool_card_row.controls), 2)
+            self.assertIsInstance(pool_card_row.controls[1].content.controls[0], main.ft.Image)
+            asyncio.run(ordered_list.controls[-1].on_accept(
+                SimpleNamespace(src=pool.controls[0])))
+            pool_target = order_row.controls[0].content
+            pool = pool_target.content.controls[1]
+            ordered_list = order_row.controls[2].content.controls[1]
+            self.assertEqual(len(pool.controls), 1)
+            asyncio.run(ordered_list.controls[-1].on_accept(
+                SimpleNamespace(src=pool.controls[0])))
+            self.assertEqual(len(ordered_list.controls), 5)
+            first_order_card = ordered_list.controls[1].content
+            preview_stack = first_order_card.content.controls[1].content
+            self.assertIsInstance(preview_stack.controls[0], main.ft.Image)
+            self.assertTrue(callable(preview_stack.controls[1].content.on_click))
+            self.assertEqual(len(self.db.list_ordered_video_ids(project_id)), 2)
+            self.assertEqual(len(pool.controls), 0)
+            asyncio.run(pool_target.on_accept(
+                SimpleNamespace(src=ordered_list.controls[1])))
+            self.assertEqual(len(self.db.list_ordered_video_ids(project_id)), 1)
+            self.assertEqual(len(pool_target.content.controls[1].controls), 1)
+            edit_select_all.on_click(None)
+            self.assertEqual(edit_count.value, '2 đã chọn')
+            asyncio.run(edit_delete.on_click(None))
+            self.assertEqual(len(edit_tab.controls[-1].controls), 0)
+            self.assertEqual(edit_count.value, '0 đã chọn')
             archive = self.root / 'selected-videos.zip'
             with patch.object(page.services[0], 'save_file',
                               new=AsyncMock(return_value=str(archive))) as save_file:
@@ -597,7 +688,7 @@ class DatabaseTests(unittest.TestCase):
             project_list = project_view.controls[0].content.controls[-1]
             asyncio.run(project_list.controls[0].controls[1].on_click(None))
             self.assertEqual(count.value, '1 đã chọn')
-            self.assertEqual([card.data for card in detail[-1].controls], [records[111]])
+            self.assertEqual([card.data for card in stock_tab.controls[-1].controls], [records[111]])
             export_folder = self.root / 'export'
             export_folder.mkdir()
             with patch.object(page.services[0], 'get_directory_path',
@@ -618,8 +709,8 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(count.value, '0 đã chọn')
             project_list = project_view.controls[0].content.controls[-1]
             asyncio.run(project_list.controls[0].controls[2].on_click(None))
-            self.assertEqual({card.data for card in detail[-1].controls}, set(records.values()))
-            card = next(card for card in detail[-1].controls if card.data == records[111])
+            self.assertEqual({card.data for card in stock_tab.controls[-1].controls}, set(records.values()))
+            card = next(card for card in stock_tab.controls[-1].controls if card.data == records[111])
             selector = card.content.controls[0].content.controls[1].content
             selector.on_click(None)
             self.assertEqual(count.value, '1 đã chọn')
@@ -629,7 +720,7 @@ class DatabaseTests(unittest.TestCase):
             asyncio.run(page.dialog.actions[1].on_click(None))
             self.assertFalse(files[111].exists())
             self.assertEqual([row['video_id'] for row in self.db.library()], [112])
-            self.assertEqual([card.data for card in detail[-1].controls], [records[112]])
+            self.assertEqual([card.data for card in stock_tab.controls[-1].controls], [records[112]])
             self.assertEqual(count.value, '0 đã chọn')
 
     def test_library_bulk_controls_export_move_and_delete(self):

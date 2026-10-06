@@ -104,11 +104,11 @@ def _download_thumbnail(video: Video, video_path: Path) -> None:
 
 def download_many(videos: list[Video], root: Path, keyword: str, cancel: Event, report: ProgressCallback,
                   database: VideoDatabase | None = None, owner: str | None = None,
-                  name_prefix: str = "") -> Path:
+                  name_prefix: str = "", workers: int = 3) -> Path:
     """Download at most three videos concurrently; completed files are never overwritten."""
     destination = root / safe_folder_name(keyword)
     destination.mkdir(parents=True, exist_ok=True)
-    with ThreadPoolExecutor(max_workers=min(3, max(1, len(videos)))) as executor:
+    with ThreadPoolExecutor(max_workers=min(max(1, workers), max(1, len(videos)))) as executor:
         futures = [executor.submit(_download_one, video, destination, cancel, report, database, owner,
                                   name_prefix) for video in videos]
         for future in as_completed(futures):
