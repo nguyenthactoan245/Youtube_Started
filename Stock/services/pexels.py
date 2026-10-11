@@ -21,7 +21,7 @@ class PexelsError(RuntimeError):
 
 
 def search_page(api_key: str, query: str, page: int = 1, per_page: int = 80,
-                quality: str = "2K", orientation: str = "landscape") -> tuple[list[Video], int]:
+                quality: str = "4K", orientation: str = "landscape") -> tuple[list[Video], int]:
     if not api_key.strip():
         raise PexelsError("Hãy nhập Pexels API key trong Setup trước khi tải.")
     params = {"query": query, "per_page": min(80, max(1, per_page)), "page": page}
@@ -82,7 +82,7 @@ def search_page(api_key: str, query: str, page: int = 1, per_page: int = 80,
 
 def select_unique(api_key: str, keyword: str, amount: int, root: Path,
                   database: VideoDatabase, owner: str, cancel: Event,
-                  quality: str = "2K", orientation: str = "landscape",
+                  quality: str = "4K", orientation: str = "landscape",
                   exclude_ids: set[int] | None = None) -> list[Video]:
     keywords = [part.strip() for part in keyword.split(",") if part.strip()]
     if len(keywords) > 1:
@@ -92,8 +92,7 @@ def select_unique(api_key: str, keyword: str, amount: int, root: Path,
             if cancel.is_set():
                 break
             found = select_unique(api_key, term, amount, root, database, owner, cancel,
-                                  exclude_ids=seen, quality=quality, orientation=orientation,
-                                  filename_prefix=filename_prefix)
+                                  exclude_ids=seen, quality=quality, orientation=orientation)
             combined.extend(found)
             seen.update(video.id for video in found)
         return combined

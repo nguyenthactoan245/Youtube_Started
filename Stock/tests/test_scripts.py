@@ -97,6 +97,12 @@ class ScriptTests(unittest.TestCase):
         self.assertEqual(view.video_settings_preferences["source"], "pixabay")
         self.assertEqual(operational_preferences["source"], "pexels")
 
+    def test_script_video_settings_default_to_4k(self):
+        view = ScriptView(SimpleNamespace(update=lambda: None), None, Path("unused"))
+
+        self.assertEqual(view.video_settings_preferences["quality"], "4K")
+        self.assertEqual(view.video_settings.controls[1].value, "4K")
+
     def test_direct_pexels_download_uses_browser_search_without_api_key(self):
         video = Video(321, "Utah", 8, "Author", "https://www.pexels.com/video/utah-321/",
                       "https://example.test/video.mp4", "", 1920, 1080, 100, "pexels")
@@ -749,7 +755,10 @@ class ScriptTests(unittest.TestCase):
         with temporary_directory() as directory:
             view = ScriptView(SimpleNamespace(update=lambda: None), None,
                               directory / "script.json", object(), directory)
-            view.video_settings_preferences.update({"method": "direct", "source": "pexels"})
+            view.video_settings_preferences.update({
+                "method": "direct", "source": "pexels",
+                "quality": "4K", "orientation": "landscape",
+            })
             # Reproduce clicking Crawl before Flet dispatches the dropdown on_change event.
             view.video_settings.workers_dropdown.value = "10"
             view.data = {"filename": "test.xlsx", "headers": ["Scene ID", "Primary search keyword"],
@@ -775,6 +784,8 @@ class ScriptTests(unittest.TestCase):
                 asyncio.run(view.download_selected(None))
 
             self.assertEqual(direct.call_count, 12)
+            self.assertTrue(all(call.args[5] == "landscape" and call.args[7] == "4K"
+                                for call in direct.call_args_list))
             api_download.assert_not_called()
             self.assertEqual(max_active, 10)
 

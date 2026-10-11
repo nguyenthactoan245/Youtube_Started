@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from threading import Event
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from models import DownloadEvent, Video
 from services.database import VideoDatabase
@@ -15,6 +15,7 @@ from services.pexels_verified import (
     download_matching_pexels_videos,
     orientation_matches,
     probe_video_dimensions,
+    quality_matches,
 )
 
 
@@ -31,6 +32,12 @@ class PexelsVerifiedTests(unittest.TestCase):
         self.assertFalse(orientation_matches(1080, 1080, "portrait"))
         self.assertTrue(orientation_matches(1080, 1080, "all"))
 
+    def test_quality_matches_selected_resolution_floor(self):
+        self.assertTrue(quality_matches(3840, 2160, "4K"))
+        self.assertFalse(quality_matches(2560, 1440, "4K"))
+        self.assertTrue(quality_matches(2560, 1440, "2K"))
+        self.assertTrue(quality_matches(640, 360, "All"))
+
     def test_probe_reads_dimensions_and_applies_rotation(self):
         result = subprocess.CompletedProcess(
             args=["ffprobe"], returncode=0,
@@ -41,6 +48,41 @@ class PexelsVerifiedTests(unittest.TestCase):
         with patch("services.pexels_verified.subprocess.run", return_value=result) as run:
             self.assertEqual(probe_video_dimensions(Path("clip.mp4"), "ffprobe"), (1080, 1920))
         self.assertEqual(run.call_args.args[0][0], "ffprobe")
+
+    def test_rejects_known_wrong_quality_before_download(self):
+        events: list[DownloadEvent] = []
+        database = MagicMock()
+        with patch("services.pexels_verified.find_ffprobe", return_value="ffprobe"), \
+             patch("services.pexels_verified.download_many") as download:
+            accepted, attempted, rejected, skipped = download_matching_pexels_videos(
+                [video(9)], 1, Path("Library"), "test", "landscape", Event(),
+                database, "owner", events.append, quality="4K")
+
+        self.assertEqual((accepted, attempted, rejected, skipped), ([], 0, 1, 0))
+        database.reserve.assert_not_called()
+        download.assert_not_called()
+        self.assertIn("trước khi tải", events[0].message)
+
+    def test_downloads_only_the_remaining_requested_amount_from_a_larger_batch(self):
+        candidates = [video(video_id) for video_id in range(1, 5)]
+        database = MagicMock()
+        database.reserve.return_value = True
+
+        with patch("services.pexels_verified.find_ffprobe", return_value="ffprobe"), \
+             patch("services.pexels_verified.download_many") as download, \
+             patch("services.pexels_verified.ThreadPoolExecutor") as pool, \
+             patch("services.pexels_verified.probe_video_dimensions",
+                   return_value=(1920, 1080)), \
+             patch.object(Path, "is_file", return_value=True):
+            accepted, attempted, rejected, skipped = download_matching_pexels_videos(
+                candidates, 2, Path("Library"), "test", "landscape", Event(),
+                database, "owner", lambda _event: None, workers=1)
+
+        self.assertEqual([item.id for item in accepted], [1, 2])
+        self.assertEqual((attempted, rejected, skipped), (2, 0, 0))
+        self.assertEqual(database.reserve.call_count, 2)
+        self.assertEqual(download.call_count, 2)
+        pool.assert_not_called()
 
     def test_discards_wrong_orientation_then_keeps_verified_candidate(self):
         with tempfile.TemporaryDirectory() as temporary:

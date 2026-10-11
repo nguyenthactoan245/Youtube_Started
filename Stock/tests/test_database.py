@@ -10,7 +10,7 @@ import zipfile
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -632,10 +632,32 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(page.dialog.title, 'Trim video ngẫu nhiên')
             duration_fields = page.dialog.content.content.controls[1].controls
             self.assertEqual([field.value for field in duration_fields], ['5,0', '6,0'])
+            trim_setup = page.dialog.content.content.controls[2].controls
+            start_from, trim_workers = trim_setup
+            self.assertEqual(start_from.value, '2,0')
+            self.assertEqual(trim_workers.value, '2')
+            self.assertEqual([option.key for option in trim_workers.options],
+                             [str(value) for value in range(1, 11)])
+            active = 0
+            max_active = 0
+            lock = Lock()
+            both_started = Event()
 
-            def fake_trim(source, destination, minimum, maximum):
+            starts = []
+
+            def fake_trim(source, destination, minimum, maximum, *, start_at=None):
+                nonlocal active, max_active
+                starts.append(start_at)
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                    if active == 2:
+                        both_started.set()
+                both_started.wait(timeout=1)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(b'trimmed')
+                with lock:
+                    active -= 1
                 return destination, 1.5, 5.5
 
             with patch.object(main, 'trim_random_video', side_effect=fake_trim), \
@@ -644,8 +666,14 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(len(edit_tab.controls[-1].controls), 2)
             edit_select_all, edit_count, edit_delete = edit_tab.controls[0].controls
             self.assertEqual(edit_tab.controls[1].value, 'Trim hoàn tất: 2 thành công, 0 lỗi.')
+            self.assertEqual(max_active, 2)
+            self.assertEqual(starts, [2.0, 2.0])
             self.assertEqual(detail[-1].selected_index, 1)
             order_tab = detail[-1].content.controls[1].controls[2]
+            order_header = order_tab.controls[0]
+            self.assertEqual(order_header.controls[-2].icon, main.ft.Icons.SHUFFLE)
+            self.assertEqual(order_header.controls[-2].tooltip,
+                             'Order ngẫu nhiên từ kho bên trái')
             order_row = order_tab.controls[2]
             pool_target = order_row.controls[0].content
             pool = pool_target.content.controls[1]

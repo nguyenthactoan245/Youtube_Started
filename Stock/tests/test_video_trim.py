@@ -7,6 +7,7 @@ import subprocess
 import sys
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,8 +31,9 @@ class VideoTrimTests(unittest.TestCase):
         subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
                         "-i", "testsrc=size=160x90:rate=25:duration=8", "-c:v", "libx264",
                         "-pix_fmt", "yuv420p", "-y", str(source)], check=True, capture_output=True)
+        from services import video_trim
         with patch("services.video_trim.shutil.which", side_effect=[ffmpeg, ffprobe]), \
-             patch("services.video_trim.subprocess.run", wraps=subprocess.run) as run:
+             patch("services.video_trim._run_process", wraps=video_trim._run_process) as run:
             trim_video(source, output, 2.34)
         args = run.call_args.args[0]
         self.assertEqual(args[args.index("-ss") + 1], "2.850")
@@ -70,6 +72,64 @@ class VideoTrimTests(unittest.TestCase):
         self.assertEqual(duration * 10, round(duration * 10))
         self.assertGreaterEqual(start, 0.0)
         self.assertLessEqual(start + duration, 8.05)
+
+    def test_two_ffmpeg_trims_can_run_concurrently(self):
+        ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+        if not ffmpeg or not ffprobe:
+            self.skipTest("FFmpeg and ffprobe are required")
+        source = self.folder / "parallel-source.mp4"
+        subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                        "-i", "testsrc=size=160x90:rate=25:duration=4", "-c:v", "libx264",
+                        "-pix_fmt", "yuv420p", "-y", str(source)], check=True,
+                       capture_output=True)
+        outputs = [self.folder / f"parallel-{index}.mp4" for index in range(2)]
+        with patch("services.video_trim.shutil.which",
+                   side_effect=lambda name: ffmpeg if name == "ffmpeg" else ffprobe):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(
+                    lambda output: trim_video(source, output, 1.5), outputs))
+
+        self.assertEqual(results, outputs)
+        self.assertTrue(all(output.is_file() and output.stat().st_size for output in outputs))
+
+    def test_nvenc_failure_retries_with_cpu_encoder(self):
+        from services import video_trim
+        source = self.folder / "source.mp4"
+        destination = self.folder / "fallback.mp4"
+        source.write_bytes(b"source")
+        commands = []
+
+        def run(args, timeout, text=False):
+            commands.append(args)
+            if "h264_nvenc" in args:
+                Path(args[-1]).write_bytes(b"partial")
+                raise subprocess.CalledProcessError(1, args)
+            Path(args[-1]).write_bytes(b"cpu-output")
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        with patch.object(video_trim, "_nvenc_available", return_value=True), \
+             patch.object(video_trim, "_run_process", side_effect=run):
+            result = video_trim._write_segment(source, destination, 1.0, 2.0, "ffmpeg")
+
+        self.assertEqual(result, destination)
+        self.assertIn("h264_nvenc", commands[0])
+        self.assertIn("libx264", commands[1])
+        self.assertEqual(destination.read_bytes(), b"cpu-output")
+
+    def test_random_trim_can_use_a_fixed_start_time(self):
+        source = self.folder / "fixed-source.mp4"
+        destination = self.folder / "fixed-output.mp4"
+        source.write_bytes(b"source")
+        with patch("services.video_trim.shutil.which", side_effect=["ffmpeg", "ffprobe"]), \
+             patch("services.video_trim._video_duration", return_value=10.0), \
+             patch("services.video_trim._write_segment", return_value=destination) as write:
+            result, start, duration = trim_random_video(
+                source, destination, 2.0, 3.0, random.Random(7), start_at=2.0)
+
+        self.assertEqual((result, start), (destination, 2.0))
+        self.assertGreaterEqual(duration, 2.0)
+        self.assertLessEqual(duration, 3.0)
+        self.assertEqual(write.call_args.args[2], 2.0)
 
 
 if __name__ == "__main__":

@@ -71,12 +71,19 @@ def orientation_matches(width: int, height: int, orientation: str) -> bool:
     return False
 
 
+def quality_matches(width: int, height: int, quality: str) -> bool:
+    """Return whether a rendition reaches the selected resolution tier."""
+    minimum = {"HD": 1280, "2K": 2560, "4K": 3840}.get(quality)
+    return minimum is None or max(width, height) >= minimum
+
+
 def download_matching_pexels_videos(
     videos: list[Video], amount: int, root: Path, keyword: str, orientation: str,
     cancel: Event, database: VideoDatabase, owner: str,
     report: Callable[[DownloadEvent], None], workers: int = 3,
+    quality: str = "All",
 ) -> tuple[list[Video], int, int, int]:
-    """Try candidates sequentially until enough downloaded files match orientation."""
+    """Download candidates and keep only files matching orientation and quality."""
     ffprobe = find_ffprobe()
     destination = Path(root) / safe_folder_name(keyword)
     accepted: list[Video] = []
@@ -84,8 +91,18 @@ def download_matching_pexels_videos(
 
     pending: list[tuple[Video, Path]] = []
     for candidate in videos:
-        if cancel.is_set():
+        if cancel.is_set() or len(pending) >= amount:
             break
+        if (candidate.width > 0 and candidate.height > 0
+                and (not orientation_matches(candidate.width, candidate.height, orientation)
+                     or not quality_matches(candidate.width, candidate.height, quality))):
+            rejected += 1
+            report(DownloadEvent(
+                candidate.id, "rejected", 0,
+                f"Bỏ qua trước khi tải: không đúng {orientation}/{quality} "
+                f"({candidate.width}×{candidate.height}).",
+            ))
+            continue
         target = destination / footage_filename(candidate)
         if not database.reserve(candidate, keyword, target, owner):
             skipped += 1
@@ -93,12 +110,17 @@ def download_matching_pexels_videos(
         attempted += 1
         pending.append((candidate, target))
 
-    with ThreadPoolExecutor(max_workers=min(max(1, workers), max(1, len(pending)))) as executor:
-        futures = {executor.submit(download_many, [candidate], Path(root), keyword,
-                                     cancel, report, database, owner): (candidate, target)
-                   for candidate, target in pending}
-        for future in futures:
-            future.result()
+    effective_workers = min(max(1, workers), max(1, len(pending)))
+    if effective_workers == 1:
+        for candidate, _target in pending:
+            download_many([candidate], Path(root), keyword, cancel, report, database, owner)
+    else:
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {executor.submit(download_many, [candidate], Path(root), keyword,
+                                         cancel, report, database, owner): (candidate, target)
+                       for candidate, target in pending}
+            for future in futures:
+                future.result()
 
     for candidate, target in pending:
         if cancel.is_set() or len(accepted) >= amount:
@@ -117,14 +139,16 @@ def download_matching_pexels_videos(
             report(DownloadEvent(candidate.id, "rejected", 1, f"Không đọc được video: {exc}"))
             continue
 
-        if not orientation_matches(width, height, orientation):
+        if (not orientation_matches(width, height, orientation)
+                or not quality_matches(width, height, quality)):
             target.unlink(missing_ok=True)
             target.with_suffix(".jpg").unlink(missing_ok=True)
             target.with_suffix(".thumb.jpg").unlink(missing_ok=True)
             database.discard_completed_download(candidate.source, candidate.id)
             rejected += 1
             report(DownloadEvent(candidate.id, "rejected", 1,
-                                 f"Đã bỏ video sai hướng ({width}×{height})."))
+                                 f"Đã bỏ video không đúng {orientation}/{quality} "
+                                 f"({width}×{height})."))
             continue
 
         verified = replace(candidate, width=width, height=height)
@@ -145,6 +169,7 @@ def download_matching_pexels_videos(
         database.update_completed_video_metadata(verified, verified_target)
         accepted.append(verified)
         report(DownloadEvent(candidate.id, "verified", 1,
-                             f"Đã xác thực hướng video ({width}×{height})."))
+                             f"Đã xác thực video {orientation}/{quality} "
+                             f"({width}×{height})."))
 
     return accepted, attempted, rejected, skipped

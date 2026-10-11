@@ -88,11 +88,11 @@ class ScriptView:
         self.posters = {}
         self.open_preview = open_preview
         self.video_preferences = video_preferences if video_preferences is not None else {
-            "quality": "2K", "orientation": "landscape"}
+            "quality": "4K", "orientation": "landscape"}
         # Keep Script choices independent from the Download page while using
         # them for every Crawl action started in this view.
         self.video_settings_preferences = {
-            "quality": self.video_preferences.get("quality", "2K"),
+            "quality": self.video_preferences.get("quality", "4K"),
             "orientation": self.video_preferences.get("orientation", "landscape"),
             "source": self.video_preferences.get("source", "pixabay"),
             "method": self.video_preferences.get("method", "api"),
@@ -938,7 +938,8 @@ class ScriptView:
                         executor, download_scene_direct_pexels,
                         row[headers.index(keyword_header)], self.library_root,
                         self.database, self.cancel, None,
-                        preferences["orientation"], script_excluded_ids)
+                        preferences["orientation"], script_excluded_ids,
+                        preferences["quality"])
                 return loop.run_in_executor(
                     executor, download_scene,
                     row[headers.index(keyword_header)], api_key, self.library_root,

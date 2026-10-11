@@ -9,12 +9,19 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from services.pexels_browser import PexelsBrowserSearchError, search_video_links, search_videos
+from services.pexels_browser import (PexelsBrowserSearchError, build_search_url,
+                                     search_video_links, search_videos)
 from services.pexels_link import PexelsLinkError
 from models import Video
 
 
 class PexelsBrowserSearchTests(unittest.TestCase):
+    def test_build_search_url_uses_video_settings_filters(self):
+        self.assertEqual(
+            build_search_url("scottish railway", "landscape", "4K"),
+            "https://www.pexels.com/search/videos/?q=scottish+railway&orientation=landscape&resolution_name=4K",
+        )
+
     def test_search_video_links_keeps_scrolling_after_first_rejected_batch(self):
         class FakeLocator:
             def __init__(self, page, selector):

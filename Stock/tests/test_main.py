@@ -16,6 +16,41 @@ from models import Video
 
 
 class EnvironmentTests(unittest.TestCase):
+    def test_random_order_selection_is_unique_bounded_and_deterministic(self) -> None:
+        chosen = main.choose_random_order_ids([1, 2, 3, 4], 3, __import__("random").Random(7))
+        self.assertEqual(chosen, [3, 1, 2])
+        self.assertEqual(len(set(chosen)), 3)
+        with self.assertRaisesRegex(ValueError, "chỉ còn 4"):
+            main.choose_random_order_ids([1, 2, 3, 4], 5)
+
+    def test_download_progress_events_are_coalesced_per_video(self) -> None:
+        events = [
+            main.DownloadEvent(1, "downloading", 0.1, "10%"),
+            main.DownloadEvent(1, "downloading", 0.8, "80%"),
+            main.DownloadEvent(2, "error", 1, "failed"),
+            main.DownloadEvent(1, "verified", 1, "verified"),
+        ]
+
+        latest, verified, errors = main.summarize_download_events(events)
+
+        self.assertEqual(latest[1].state, "verified")
+        self.assertEqual(latest[2].state, "error")
+        self.assertEqual((verified, errors), (1, 1))
+
+    def test_keyword_workers_are_capped_by_keyword_count(self) -> None:
+        self.assertEqual(main.keyword_worker_count(1, 10), 1)
+        self.assertEqual(main.keyword_worker_count(4, 10), 4)
+        self.assertEqual(main.keyword_worker_count(10, 3), 3)
+
+    def test_live_worker_dropdown_overrides_stale_saved_value(self) -> None:
+        preferences = {"workers": "5"}
+        settings = SimpleNamespace(workers_dropdown=SimpleNamespace(value="6"))
+
+        workers = main.selected_worker_count(settings, preferences)
+
+        self.assertEqual(workers, 6)
+        self.assertEqual(preferences["workers"], "6")
+
     def test_dotenv_replaces_an_empty_environment_value(self) -> None:
         with patch.dict(os.environ, {"PIXABAY_API_KEY": ""}, clear=False), \
              patch.object(Path, 'read_text', return_value='PIXABAY_API_KEY=test-key\n'), \

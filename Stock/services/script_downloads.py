@@ -77,7 +77,8 @@ def download_scene(keyword: str, api_key: str, root: Path, database: VideoDataba
 
 def download_scene_direct_pexels(keyword: str, root: Path, database: VideoDatabase, cancel: Event,
                                  report=None, orientation: str = "landscape",
-                                 exclude_ids: set[int] | None = None) -> str:
+                                 exclude_ids: set[int] | None = None,
+                                 quality: str = "4K") -> str:
     """Find and download one public Pexels video without using an API key."""
     term = keyword.strip()
     if not term:
@@ -96,12 +97,14 @@ def download_scene_direct_pexels(keyword: str, root: Path, database: VideoDataba
             matching, _, _, _ = download_matching_pexels_videos(
                 fresh, 1, root, term, orientation, cancel, database, owner,
                 report or (lambda _event: None),
+                quality=quality,
             )
             accepted.extend(matching)
             return bool(accepted) or cancel.is_set()
 
         search_pexels_videos_direct(
             term, 1, cancel, exclude_ids=attempted_ids, on_batch=process_candidates,
+            orientation=orientation, quality=quality,
         )
 
     if cancel.is_set():

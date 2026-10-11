@@ -13,7 +13,7 @@ from services.api_keys import ApiKeyPool
 
 def select_unique(api_key: str, keyword: str, amount: int, root: Path,
                   database: VideoDatabase, owner: str, cancel: Event,
-                  exclude_ids: set[int] | None = None, quality: str = "2K",
+                  exclude_ids: set[int] | None = None, quality: str = "4K",
                   orientation: str = "landscape", filename_prefix: str = "") -> list[Video]:
     keywords = [part.strip() for part in keyword.split(",") if part.strip()]
     if len(keywords) > 1:

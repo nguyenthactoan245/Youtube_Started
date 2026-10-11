@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import random
 import sqlite3
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
@@ -41,6 +43,46 @@ SIDEBAR_LOGO = "5166961.png"
 PREVIEW_WIDTH = 1280
 PREVIEW_HEIGHT = 720
 LIBRARY_THUMBNAIL_CACHE: WeakKeyDictionary[VideoDatabase, dict[int, dict]] = WeakKeyDictionary()
+
+
+def keyword_worker_count(keyword_count: int, requested_workers: int) -> int:
+    """Use at most one worker per keyword, capped by the user's worker setting."""
+    return max(1, min(keyword_count, requested_workers))
+
+
+def selected_worker_count(settings, preferences: dict, default: int = 5) -> int:
+    """Read the live dropdown value so a just-made UI change applies immediately."""
+    dropdown = getattr(settings, "workers_dropdown", None)
+    value = dropdown.value if dropdown is not None else preferences.get("workers", default)
+    try:
+        workers = max(1, min(20, int(value)))
+    except (TypeError, ValueError):
+        workers = default
+    preferences["workers"] = str(workers)
+    return workers
+
+
+def summarize_download_events(
+    events: list[DownloadEvent],
+) -> tuple[dict[int, DownloadEvent], int, int]:
+    """Keep the newest UI event per video while preserving terminal counts."""
+    latest: dict[int, DownloadEvent] = {}
+    verified = errors = 0
+    for event in events:
+        latest[event.video_id] = event
+        verified += event.state == "verified"
+        errors += event.state == "error"
+    return latest, verified, errors
+
+
+def choose_random_order_ids(available_ids: list[int], amount: int,
+                            chooser: random.Random | None = None) -> list[int]:
+    """Choose unique pool videos in randomized order without mutating the pool."""
+    if amount < 1:
+        raise ValueError("Số lượng video phải lớn hơn 0.")
+    if amount > len(available_ids):
+        raise ValueError(f"Kho bên trái chỉ còn {len(available_ids)} video.")
+    return (chooser or random).sample(available_ids, amount)
 
 
 def format_progress_timing(done: int, total: int, started_at: float) -> str:
@@ -345,6 +387,13 @@ async def main(page: ft.Page) -> None:
     if hasattr(page, "services"):
         page.services.append(file_picker)
 
+    def patch_controls(*controls: ft.Control) -> None:
+        """Patch only changed controls; support minimal Page doubles used by tests."""
+        try:
+            page.update(*controls)
+        except TypeError:
+            page.update()
+
     keyword = ft.TextField(label="Keyword", hint_text="Ví dụ: Moscow, Scotland, Alaska", expand=True, autofocus=True)
     amount = ft.TextField(label="Số video", value="10", width=110, input_filter=ft.InputFilter(allow=True, regex_string=r"[0-9]"))
     start = ft.FilledButton("Tìm & tải", icon=ft.Icons.DOWNLOAD)
@@ -369,7 +418,7 @@ async def main(page: ft.Page) -> None:
     selected_download: set[int] = set()
     download_select_controls: dict[int, list[tuple[ft.IconButton, ft.Container]]] = {}
     download_selected_count = ft.Text("0 đã chọn", size=12, color=ft.Colors.BLUE_GREY_300)
-    video_preferences = {"quality": "2K", "orientation": "landscape", "source": "pexels",
+    video_preferences = {"quality": "4K", "orientation": "landscape", "source": "pexels",
                          "method": "direct", "workers": "5"}
     download_video_settings = build_video_settings(
         video_preferences, include_source=True, include_method=True, include_workers=True)
@@ -422,14 +471,16 @@ async def main(page: ft.Page) -> None:
     download_move = ft.IconButton(icon=ft.Icons.DRIVE_FILE_MOVE_OUTLINE,
                                   tooltip="Gắn vào project/chapter", disabled=True)
 
-    def update_download_selection() -> None:
+    def update_download_selection(*, patch_page: bool = True) -> None:
         selected_download.intersection_update(download_videos)
+        changed_cards: list[ft.Control] = []
         for video_id, controls in download_select_controls.items():
             chosen = video_id in selected_download
             for button, container in controls:
                 button.icon = ft.Icons.CHECK_BOX if chosen else ft.Icons.CHECK_BOX_OUTLINE_BLANK
                 button.icon_color = ft.Colors.CYAN_200 if chosen else ft.Colors.WHITE
                 container.bgcolor = "#20335a" if chosen else "#131c33"
+                changed_cards.extend((button, container))
         count = len(selected_download)
         download_selected_count.value = f"{count} đã chọn"
         download_select_all.disabled = not download_videos
@@ -437,7 +488,9 @@ async def main(page: ft.Page) -> None:
                                     else ft.Icons.SELECT_ALL)
         for button in (download_delete, download_save, download_move):
             button.disabled = count == 0 or start.disabled or action_busy
-        page.update()
+        if patch_page:
+            patch_controls(*changed_cards, download_select_all, download_selected_count,
+                           download_delete, download_save, download_move)
 
     def toggle_download_selection(video_id: int) -> None:
         if video_id in selected_download:
@@ -698,7 +751,7 @@ async def main(page: ft.Page) -> None:
         def report(event: DownloadEvent) -> None:
             loop.call_soon_threadsafe(queue.put_nowait, event)
 
-        worker_count = max(1, min(20, int(video_preferences.get("workers", "5"))))
+        worker_count = selected_worker_count(download_video_settings, video_preferences)
         worker = asyncio.create_task(asyncio.to_thread(download_many, videos, LIBRARY_ROOT, term,
                                                        cancel_event, report, database, owner, "", worker_count))
         completed = 0
@@ -785,8 +838,11 @@ async def main(page: ft.Page) -> None:
         download_videos.clear()
         selected_download.clear()
         download_select_controls.clear()
-        update_download_selection()
-        page.update()
+        update_download_selection(patch_page=False)
+        patch_controls(status, overall, overall_count, grid, download_list,
+                       start, pexels_link_button, cancel_button,
+                       download_select_all, download_selected_count,
+                       download_delete, download_save, download_move)
         video = None
         try:
             video = await asyncio.to_thread(resolve_pexels_video, pexels_url.value or "")
@@ -816,7 +872,8 @@ async def main(page: ft.Page) -> None:
 
             worker = asyncio.create_task(asyncio.to_thread(
                 download_many, [video], LIBRARY_ROOT, video.tags, cancel_event,
-                report, database, owner, "", max(1, min(20, int(video_preferences.get("workers", "5"))))))
+                report, database, owner, "",
+                selected_worker_count(download_video_settings, video_preferences)))
             completed = 0
             failed = 0
             while not worker.done() or not queue.empty():
@@ -969,8 +1026,11 @@ async def main(page: ft.Page) -> None:
         download_videos.clear()
         selected_download.clear()
         download_select_controls.clear()
-        update_download_selection()
-        page.update()
+        update_download_selection(patch_page=False)
+        patch_controls(status, overall, overall_count, grid, download_list,
+                       start, pexels_link_button, cancel_button,
+                       download_select_all, download_selected_count,
+                       download_delete, download_save, download_move)
 
         try:
             overall.value = 0
@@ -979,76 +1039,94 @@ async def main(page: ft.Page) -> None:
             overall_count.visible = True
             status.value = (f"Searching and checking Pexels results until {count} videos match "
                             f"{video_preferences['orientation']} orientation...")
-            page.update()
+            patch_controls(status, overall, overall_count)
             queue: asyncio.Queue[DownloadEvent] = asyncio.Queue()
             loop = asyncio.get_running_loop()
+            requested_workers = selected_worker_count(download_video_settings, video_preferences)
+            active_workers = keyword_worker_count(len(terms), requested_workers)
+            status.value = (f"Đang chạy {active_workers} luồng cho {len(terms)} keyword "
+                            f"(mỗi keyword 1 luồng)...")
+            page.update(status)
 
             def report(event: DownloadEvent) -> None:
                 loop.call_soon_threadsafe(queue.put_nowait, event)
 
-            accepted_videos: list[Video] = []
-            attempted_ids: set[int] = set()
-            attempted = rejected = skipped = 0
-            active_term = terms[0]
-            active_term_videos: list[Video] = []
+            def process_keyword(active_term: str):
+                term_videos: list[Video] = []
+                attempted_ids: set[int] = set()
+                attempted = rejected = skipped = 0
 
-            def process_candidate_batch(candidates: list[Video]) -> bool:
-                nonlocal attempted, rejected, skipped
-                fresh = [candidate for candidate in candidates
-                         if candidate.id not in attempted_ids]
-                attempted_ids.update(candidate.id for candidate in fresh)
-                if not fresh or cancel_event.is_set():
-                    return cancel_event.is_set()
-                accepted, tried, discarded, existing = download_matching_pexels_videos(
-                    fresh, per_keyword_count - len(active_term_videos), LIBRARY_ROOT, active_term,
-                    video_preferences["orientation"], cancel_event, database, owner, report,
-                    workers=max(1, min(20, int(video_preferences.get("workers", "5")))))
-                accepted_videos.extend(accepted)
-                active_term_videos.extend(accepted)
-                attempted += tried
-                rejected += discarded
-                skipped += existing
-                return cancel_event.is_set() or len(accepted_videos) >= count
+                def process_candidate_batch(candidates: list[Video]) -> bool:
+                    nonlocal attempted, rejected, skipped
+                    fresh = [candidate for candidate in candidates
+                             if candidate.id not in attempted_ids]
+                    attempted_ids.update(candidate.id for candidate in fresh)
+                    if not fresh or cancel_event.is_set():
+                        return cancel_event.is_set()
+                    accepted, tried, discarded, existing = download_matching_pexels_videos(
+                        fresh, per_keyword_count - len(term_videos), LIBRARY_ROOT, active_term,
+                        video_preferences["orientation"], cancel_event, database, owner, report,
+                        workers=1, quality=video_preferences["quality"])
+                    term_videos.extend(accepted)
+                    attempted += tried
+                    rejected += discarded
+                    skipped += existing
+                    return cancel_event.is_set() or len(term_videos) >= per_keyword_count
 
-            def search_and_download():
-                nonlocal active_term, active_term_videos
-                for active_term in terms:
-                    active_term_videos = []
-                    if cancel_event.is_set():
-                        break
+                if not cancel_event.is_set():
                     search_pexels_videos_direct(
                         active_term, per_keyword_count, cancel_event, exclude_ids=attempted_ids,
                         on_batch=process_candidate_batch,
+                        orientation=video_preferences["orientation"],
+                        quality=video_preferences["quality"],
                     )
+                return term_videos, attempted, rejected, skipped
+
+            def search_and_download():
+                accepted_videos: list[Video] = []
+                attempted = rejected = skipped = 0
+                with ThreadPoolExecutor(max_workers=active_workers,
+                                        thread_name_prefix="pexels-keyword") as executor:
+                    futures = [executor.submit(process_keyword, active_term)
+                               for active_term in terms]
+                    for future in as_completed(futures):
+                        videos, term_attempted, term_rejected, term_skipped = future.result()
+                        accepted_videos.extend(videos)
+                        attempted += term_attempted
+                        rejected += term_rejected
+                        skipped += term_skipped
                 return accepted_videos, attempted, rejected, skipped
 
             worker = asyncio.create_task(asyncio.to_thread(search_and_download))
             verified_count = 0
             failed = 0
-            terminal_states = {"verified", "rejected", "error", "cancelled"}
             while not worker.done() or not queue.empty():
                 try:
-                    event = await asyncio.wait_for(queue.get(), timeout=0.15)
+                    first_event = await asyncio.wait_for(queue.get(), timeout=0.15)
                 except TimeoutError:
                     continue
-                for progress, label in cards.get(event.video_id, []):
-                    progress.value = event.progress
-                    label.value = event.message
-                    label.color = {
-                        "done": ft.Colors.CYAN_300,
-                        "verified": ft.Colors.GREEN_300,
-                        "rejected": ft.Colors.AMBER_300,
-                        "error": ft.Colors.RED_300,
-                        "cancelled": ft.Colors.AMBER_300,
-                    }.get(event.state, ft.Colors.BLUE_200)
-                if event.state in terminal_states:
-                    failed += event.state == "error"
-                if event.state == "verified":
-                    verified_count += 1
-                    overall.value = min(1.0, verified_count / count)
-                    overall_count.value = format_progress_timing(verified_count, count, progress_started_at)
+                events = [first_event]
+                while not queue.empty():
+                    events.append(queue.get_nowait())
+                latest_by_video, newly_verified, new_errors = summarize_download_events(events)
+                verified_count += newly_verified
+                failed += new_errors
+                for event in latest_by_video.values():
+                    for progress, label in cards.get(event.video_id, []):
+                        progress.value = event.progress
+                        label.value = event.message
+                        label.color = {
+                            "done": ft.Colors.CYAN_300,
+                            "verified": ft.Colors.GREEN_300,
+                            "rejected": ft.Colors.AMBER_300,
+                            "error": ft.Colors.RED_300,
+                            "cancelled": ft.Colors.AMBER_300,
+                        }.get(event.state, ft.Colors.BLUE_200)
+                overall.value = min(1.0, verified_count / count)
+                overall_count.value = format_progress_timing(
+                    verified_count, count, progress_started_at)
                 status.value = f"Đang tải {verified_count}/{count}"
-                page.update()
+                patch_controls(status, overall, overall_count)
 
             selected_videos, attempted, rejected, skipped = await worker
             overall.value = min(1.0, len(selected_videos) / count)
@@ -1067,7 +1145,7 @@ async def main(page: ft.Page) -> None:
                     label.value = f"Verified: {video.width}x{video.height}"
                     label.color = ft.Colors.GREEN_300
             selected_download.intersection_update(valid_ids)
-            update_download_selection()
+            update_download_selection(patch_page=False)
 
             library_loaded = False
             if not failed and not cancel_event.is_set():
@@ -1118,8 +1196,11 @@ async def main(page: ft.Page) -> None:
             overall_count.visible = False
             set_download_buttons_idle()
             cancel_button.disabled = True
-            update_download_selection()
-            page.update()
+            update_download_selection(patch_page=False)
+            patch_controls(status, overall, overall_count, grid, download_list,
+                           start, pexels_link_button, cancel_button,
+                           download_select_all, download_selected_count,
+                           download_delete, download_save, download_move)
 
     def cancel_download(_: ft.ControlEvent) -> None:
         if cancel_event:
@@ -1567,6 +1648,8 @@ async def main(page: ft.Page) -> None:
     order_status = ft.Text(size=12, color=ft.Colors.BLUE_GREY_300)
     order_export = ft.IconButton(icon=ft.Icons.DOWNLOAD,
                                  tooltip="Tải video theo thứ tự", disabled=True)
+    order_random = ft.IconButton(icon=ft.Icons.SHUFFLE,
+                                 tooltip="Order ngẫu nhiên từ kho bên trái", disabled=True)
     order_thumbnail_cache: dict[str, bytes | None] = {}
     active_order_drag: dict[str, int | str | None] = {"origin": None, "record_id": None}
     selected_project_id: int | None = None
@@ -1863,6 +1946,69 @@ async def main(page: ft.Page) -> None:
         render_order_layout()
         page.update()
 
+    def show_random_order_dialog(_: ft.ControlEvent | None = None) -> None:
+        if selected_project_id is None:
+            return
+        key = (selected_project_id, selected_chapter_id)
+        records = {row["id"]: row for row in project_entries}
+        trims = edit_trim_rows.get(key, {})
+        sequence = order_sequences.get(key, [])
+        available = [record_id for record_id in edit_sequences.get(key, [])
+                     if record_id in records and record_id not in sequence
+                     and (trims.get(record_id) or {}).get("trim_status") == "completed"
+                     and Path((trims.get(record_id) or {}).get("trimmed_path") or "").is_file()]
+        if not available:
+            order_status.value = "Kho video trim bên trái không còn video để order."
+            order_status.color = ft.Colors.AMBER_300
+            patch_controls(order_status)
+            return
+        amount = ft.TextField(label="Số lượng video", value=str(min(10, len(available))),
+                              width=180, keyboard_type=ft.KeyboardType.NUMBER)
+        message = ft.Text(size=12, color=ft.Colors.RED_300)
+
+        def close(_: ft.ControlEvent) -> None:
+            page.pop_dialog()
+
+        async def apply(_: ft.ControlEvent) -> None:
+            try:
+                chosen = choose_random_order_ids(available, int(amount.value or "0"))
+            except (TypeError, ValueError) as exc:
+                message.value = str(exc) or "Số lượng video không hợp lệ."
+                patch_controls(message)
+                return
+            new_sequence = [*order_sequences.get(key, []), *chosen]
+            try:
+                await asyncio.to_thread(database.save_ordered_video_ids, new_sequence, *key)
+                order_sequences[key] = new_sequence
+                order_status.value = f"Đã thêm ngẫu nhiên {len(chosen)} video vào thứ tự."
+                order_status.color = ft.Colors.BLUE_200
+                page.pop_dialog()
+            except (ValueError, sqlite3.Error) as exc:
+                message.value = str(exc) or "Không thể lưu thứ tự video ngẫu nhiên."
+                patch_controls(message)
+                return
+            render_order_layout()
+            patch_controls(order_status, order_pool, order_list, order_export, order_random)
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title="Order video ngẫu nhiên",
+            content=ft.Container(width=360, content=ft.Column(tight=True, spacing=12, controls=[
+                ft.Text(f"Có {len(available)} video trong kho bên trái.",
+                        color=ft.Colors.BLUE_GREY_300),
+                amount,
+                ft.Text("Video được chọn ngẫu nhiên sẽ nối vào cuối danh sách bên phải.",
+                        size=12, color=ft.Colors.BLUE_GREY_300),
+                message,
+            ])),
+            actions=[ft.TextButton("Hủy", on_click=close),
+                     ft.FilledButton("Order ngẫu nhiên", icon=ft.Icons.SHUFFLE,
+                                     on_click=apply)],
+        )
+        page.show_dialog(dialog)
+
+    order_random.on_click = show_random_order_dialog
+
     def order_drop_target(index: int, content: ft.Control) -> ft.DragTarget:
         async def accept(event: ft.DragTargetEvent) -> None:
             data = dragged_order_data(event)
@@ -1923,6 +2069,8 @@ async def main(page: ft.Page) -> None:
                                                        color=ft.Colors.BLUE_GREY_300))))
         order_list.controls[:] = order_controls
         order_export.disabled = not ordered or action_busy
+        order_random.disabled = not any(record_id in available and record_id not in ordered
+                                        for record_id in available) or action_busy
 
     def render_edit_grid() -> None:
         key = (selected_project_id, selected_chapter_id) if selected_project_id is not None else None
@@ -2013,6 +2161,15 @@ async def main(page: ft.Page) -> None:
                                keyboard_type=ft.KeyboardType.NUMBER)
         maximum = ft.TextField(label="Max duration (s)", value="6,0", width=155,
                                keyboard_type=ft.KeyboardType.NUMBER)
+        start_from = ft.TextField(label="Bắt đầu từ (s)", value="2,0", width=155,
+                                  keyboard_type=ft.KeyboardType.NUMBER)
+        trim_workers = ft.Dropdown(
+            label="Số luồng trim",
+            value=str(min(4, len(chosen_ids))),
+            width=155,
+            options=[ft.DropdownOption(key=str(value), text=str(value))
+                     for value in range(1, 11)],
+        )
         message = ft.Text(size=12, color=ft.Colors.RED_300)
 
         def close(_: ft.ControlEvent) -> None:
@@ -2022,10 +2179,13 @@ async def main(page: ft.Page) -> None:
             try:
                 min_seconds = round(float((minimum.value or "").replace(",", ".")), 1)
                 max_seconds = round(float((maximum.value or "").replace(",", ".")), 1)
-                if min_seconds <= 0 or max_seconds < min_seconds:
+                start_seconds = round(float((start_from.value or "").replace(",", ".")), 3)
+                worker_count = min(len(chosen_ids), max(1, int(trim_workers.value or "1")))
+                if min_seconds <= 0 or max_seconds < min_seconds or start_seconds < 0:
                     raise ValueError
             except (TypeError, ValueError):
-                message.value = "Duration phải lớn hơn 0 và Max phải lớn hơn hoặc bằng Min."
+                message.value = ("Mốc bắt đầu phải từ 0 giây; Duration phải lớn hơn 0 "
+                                 "và Max phải lớn hơn hoặc bằng Min.")
                 page.update()
                 return
             project_id, chapter_id = selected_project_id, selected_chapter_id
@@ -2035,30 +2195,44 @@ async def main(page: ft.Page) -> None:
             set_action_busy(True)
             completed = failed = 0
             try:
-                for position, record_id in enumerate(chosen, 1):
+                semaphore = asyncio.Semaphore(worker_count)
+
+                async def trim_one(record_id: int) -> bool:
                     record = records.get(record_id)
                     if record is None:
-                        failed += 1
-                        continue
-                    edit_status.value = f"Đang trim {position}/{len(chosen)} video..."
-                    edit_status.color = ft.Colors.BLUE_200
-                    page.update()
+                        return False
                     source = Path(record["file_path"])
                     scope = str(chapter_id) if chapter_id is not None else "project"
                     destination = ROOT / "edits" / str(project_id) / scope / f"{record_id}_trimmed.mp4"
-                    try:
+                    async with semaphore:
                         output, start_time, duration = await asyncio.to_thread(
-                            trim_random_video, source, destination, min_seconds, max_seconds)
+                            trim_random_video, source, destination, min_seconds, max_seconds,
+                            start_at=start_seconds)
                         await asyncio.to_thread(database.save_edit_trim, record_id, project_id,
                                                 chapter_id, output, start_time, duration)
-                        completed += 1
+                    return True
+
+                async def trim_safely(record_id: int) -> bool:
+                    try:
+                        return await trim_one(record_id)
                     except Exception as exc:
-                        failed += 1
                         try:
                             await asyncio.to_thread(database.save_edit_trim_error, record_id,
                                                     project_id, chapter_id, str(exc))
                         except sqlite3.Error:
                             pass
+                        return False
+
+                tasks = [asyncio.create_task(trim_safely(record_id)) for record_id in chosen]
+                edit_status.color = ft.Colors.BLUE_200
+                for position, task in enumerate(asyncio.as_completed(tasks), 1):
+                    if await task:
+                        completed += 1
+                    else:
+                        failed += 1
+                    edit_status.value = (f"Đang trim {position}/{len(chosen)} video "
+                                         f"· {worker_count} luồng...")
+                    page.update()
                 await reload_edit_scope(project_id, chapter_id)
                 render_edit_grid()
                 edit_status.value = f"Trim hoàn tất: {completed} thành công, {failed} lỗi."
@@ -2073,7 +2247,9 @@ async def main(page: ft.Page) -> None:
             content=ft.Container(width=350, content=ft.Column(tight=True, spacing=12, controls=[
                 ft.Text(f"{len(chosen_ids)} video đã chọn",
                         color=ft.Colors.BLUE_GREY_300),
-                ft.Row([minimum, maximum]),
+                ft.Row([minimum, maximum]), ft.Row([start_from, trim_workers]),
+                ft.Text("Ưu tiên NVIDIA NVENC; tự chuyển sang CPU nếu GPU không khả dụng.",
+                        size=12, color=ft.Colors.GREEN_300),
                 ft.Text("Mỗi video stock sẽ tạo một clip trim; video gốc vẫn được giữ trong Edit.",
                         size=12, color=ft.Colors.BLUE_GREY_300),
                 message,
@@ -2516,7 +2692,8 @@ async def main(page: ft.Page) -> None:
                 ft.Column(expand=True, spacing=10, controls=[
                     ft.Row([ft.Text("Kho video trim", weight=ft.FontWeight.W_600, expand=True),
                             ft.Text("Thứ tự tải về", weight=ft.FontWeight.W_600, expand=True),
-                            order_export], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                            order_random, order_export],
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     order_status,
                     ft.Row(expand=True, spacing=12, controls=[
                         ft.Container(expand=True, padding=ft.Padding.all(8),

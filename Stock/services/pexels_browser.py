@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
-from urllib.parse import quote, urlparse
+from urllib.parse import urlencode, urlparse
 
 from services.pexels_link import PexelsLinkError, resolve_pexels_video
 
@@ -20,8 +20,19 @@ class PexelsBrowserBlocked(PexelsBrowserSearchError):
 _VIDEO_PATH = re.compile(r"/video/[^/]+-(\d{1,12})/?$")
 
 
+def build_search_url(keyword: str, orientation: str = "all", quality: str = "4K") -> str:
+    """Build the same filtered URL used by Pexels' video search page."""
+    params = {"q": keyword.strip()}
+    if orientation in {"landscape", "portrait"}:
+        params["orientation"] = orientation
+    if quality in {"HD", "2K", "4K"}:
+        params["resolution_name"] = quality
+    return f"https://www.pexels.com/search/videos/?{urlencode(params)}"
+
+
 def search_video_links(keyword: str, count: int, cancel: Event | None = None,
-                       *, max_scrolls: int = 80, on_batch=None) -> list[str]:
+                       *, orientation: str = "all", quality: str = "4K",
+                       max_scrolls: int = 80, on_batch=None) -> list[str]:
     """Read up to ``count`` video-page links from a visible, standard Chrome session.
 
     The function does not retry, solve challenges, alter browser fingerprints, or
@@ -55,7 +66,7 @@ def search_video_links(keyword: str, count: int, cancel: Event | None = None,
             try:
                 page = browser.new_page(viewport={"width": 1440, "height": 1000})
                 response = page.goto(
-                    f"https://www.pexels.com/search/videos/{quote(term, safe='')}/",
+                    build_search_url(term, orientation, quality),
                     wait_until="domcontentloaded",
                     timeout=60000,
                 )
@@ -141,7 +152,8 @@ def search_video_links(keyword: str, count: int, cancel: Event | None = None,
 
 def search_videos(keyword: str, count: int, cancel: Event | None = None, *,
                   exclude_ids: set[int] | None = None, on_batch=None,
-                  max_scrolls: int = 80) -> list:
+                  max_scrolls: int = 80, orientation: str = "all",
+                  quality: str = "4K") -> list:
     """Search results in batches and optionally process each batch before scrolling."""
     def resolve(link: str):
         match = _VIDEO_PATH.fullmatch(urlparse(link).path)
@@ -167,6 +179,7 @@ def search_videos(keyword: str, count: int, cancel: Event | None = None, *,
         return bool(videos and on_batch and on_batch(videos))
 
     search_video_links(keyword, max(1, min(4, count)), cancel,
+                       orientation=orientation, quality=quality,
                        max_scrolls=max_scrolls, on_batch=resolve_batch)
     videos = [video for video, _ in results_all if video is not None]
     errors = [error for _, error in results_all if error]

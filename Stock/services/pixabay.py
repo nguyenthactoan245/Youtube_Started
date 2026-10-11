@@ -153,7 +153,7 @@ def _choose_rendition(renditions: dict[str, Any], quality: str) -> dict[str, Any
         return None
     if quality == "All":
         return max(available, key=lambda item: int(item["width"]) * int(item["height"]))
-    target = QUALITY_TARGETS.get(quality, QUALITY_TARGETS["2K"])
+    target = QUALITY_TARGETS.get(quality, QUALITY_TARGETS["4K"])
     above_target = [item for item in available
                     if max(int(item["width"]), int(item["height"])) >= target]
     if above_target:
@@ -162,7 +162,7 @@ def _choose_rendition(renditions: dict[str, Any], quality: str) -> dict[str, Any
 
 
 def search_page(api_key: str | ApiKeyPool, keyword: str, page: int = 1,
-                cache_dir: Path | None = None, cancel=None, quality: str = "2K",
+                cache_dir: Path | None = None, cancel=None, quality: str = "4K",
                 orientation: str = "landscape") -> tuple[list[Video], int]:
     """Read one 200-hit page, reusing the shared 24-hour search cache."""
     if not (bool(api_key) if isinstance(api_key, ApiKeyPool) else api_key.strip()):
@@ -206,7 +206,7 @@ def search_page(api_key: str | ApiKeyPool, keyword: str, page: int = 1,
 
 
 def search_videos(api_key: str, keyword: str, amount: int, cache_dir: Path | None = None,
-                  quality: str = "2K", orientation: str = "landscape") -> list[Video]:
+                  quality: str = "4K", orientation: str = "landscape") -> list[Video]:
     videos, _ = search_page(api_key, keyword, cache_dir=cache_dir, quality=quality,
                             orientation=orientation)
     return videos[:amount]

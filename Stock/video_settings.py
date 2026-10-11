@@ -8,7 +8,7 @@ def build_video_settings(preferences: dict[str, str], include_source: bool = Fal
                          include_method: bool = False, include_workers: bool = False) -> ft.Row:
     quality = ft.Dropdown(
         label="Chất lượng",
-        value=preferences.get("quality", "2K"),
+        value=preferences.get("quality", "4K"),
         width=170,
         options=[ft.DropdownOption(key=value, text=value) for value in ("All", "HD", "2K", "4K")],
     )
@@ -24,7 +24,7 @@ def build_video_settings(preferences: dict[str, str], include_source: bool = Fal
     )
 
     def update_quality(event):
-        preferences["quality"] = event.control.value or "2K"
+        preferences["quality"] = event.control.value or "4K"
 
     def update_orientation(event):
         preferences["orientation"] = event.control.value or "landscape"
