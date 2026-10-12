@@ -24,6 +24,7 @@ from video_settings import build_video_settings
 from services.assets import delete_videos, export_named_videos, export_videos, export_videos_zip
 from services.catalog import select_unique
 from services.database import VideoDatabase
+from services.diagnostics import record as record_diagnostic
 from services.downloader import download_many, footage_filename, safe_folder_name
 from services.pixabay import PixabayError, PixabayAccessPause
 from services.pexels import PexelsError, select_unique as select_pexels_unique
@@ -131,6 +132,24 @@ def format_size(size: int) -> str:
     return f"{size / 1_000_000:.1f} MB" if size else "—"
 
 
+def format_record_resolution(record: dict) -> str:
+    """Return a stable dimensions label from saved provider/probed metadata."""
+    details = record.get("details") or {}
+    try:
+        width = int(details.get("width") or 0)
+        height = int(details.get("height") or 0)
+    except (TypeError, ValueError):
+        return ""
+    return f"{width} × {height}" if width > 0 and height > 0 else ""
+
+
+def format_record_media_info(record: dict) -> str:
+    parts = [format_record_resolution(record)]
+    if record.get("exists_on_disk"):
+        parts.append(format_size(record.get("size_on_disk", 0)))
+    return " · ".join(part for part in parts if part)
+
+
 def format_duration(seconds: int) -> str:
     return f"{seconds // 60}:{seconds % 60:02d}"
 
@@ -166,6 +185,30 @@ def library_poster(video_path: Path) -> bytes | None:
             except OSError:
                 pass
     return None
+
+
+def stored_thumbnail_bytes(video_path: Path) -> bytes | None:
+    """Read a fresh sidecar thumbnail without invoking FFmpeg during UI rendering."""
+    try:
+        video_mtime = video_path.stat().st_mtime_ns
+    except OSError:
+        return None
+    for candidate in (video_path.with_suffix(".thumb.jpg"), video_path.with_suffix(".jpg")):
+        try:
+            if candidate.stat().st_mtime_ns >= video_mtime and is_jpeg(candidate):
+                return candidate.read_bytes()
+        except OSError:
+            continue
+    return None
+
+
+def media_file_fingerprint(path: Path) -> tuple[int, int] | None:
+    """Return the cheap identity used to invalidate an in-memory media thumbnail."""
+    try:
+        stat = path.stat()
+        return stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return None
 
 
 def load_library_entries(database: VideoDatabase) -> list[dict]:
@@ -1428,8 +1471,8 @@ async def main(page: ft.Page) -> None:
             poster = record["poster_bytes"]
             details = record["details"]
             caption = details.get("tags") or file.name
-            size = record["size_on_disk"]
-            note = (f"{relative_path.parent} · {format_size(size)}" if exists
+            media_info = format_record_media_info(record)
+            note = (f"{relative_path.parent} · {media_info}" if exists
                     else "File không còn trên đĩa · vẫn giữ lịch sử")
             if record["status"] == "review":
                 note += " · Chưa rõ ID Pixabay"
@@ -1611,7 +1654,80 @@ async def main(page: ft.Page) -> None:
     chapter_count = ft.Text("Các chapter của project sẽ xuất hiện ở đây.", color=ft.Colors.BLUE_GREY_300)
     chapter_name = ft.TextField(label="Tên chapter", hint_text="Ví dụ: Chapter 1", expand=True, disabled=True)
     chapter_create = ft.FilledButton("Thêm chapter", icon=ft.Icons.ADD, disabled=True)
+    project_batch_download = ft.OutlinedButton(
+        "Tải hàng loạt", icon=ft.Icons.DOWNLOAD_FOR_OFFLINE, disabled=True)
+    project_batch_trim = ft.OutlinedButton(
+        "Trim hàng loạt", icon=ft.Icons.CONTENT_CUT, disabled=True)
+    project_run_sequence = ft.OutlinedButton(
+        "Chạy tuần tự", icon=ft.Icons.PLAYLIST_PLAY, disabled=True)
+    chapter_input_row = ft.Row(
+        [chapter_name, chapter_create], vertical_alignment=ft.CrossAxisAlignment.END)
+    project_actions_row = ft.Row(
+        [project_batch_download, project_batch_trim, project_run_sequence], spacing=8)
+    chapter_create_row = ft.Column(
+        [chapter_input_row, project_actions_row], spacing=8)
     chapter_feedback = ft.Text(size=12, color=ft.Colors.RED_300)
+    chapter_video_preferences = {
+        "quality": "4K", "orientation": "landscape", "source": "pexels",
+        "method": "direct", "workers": "5",
+    }
+    chapter_video_settings = build_video_settings(
+        chapter_video_preferences, include_source=True, include_method=True,
+        include_workers=True)
+    chapter_keyword = ft.TextField(
+        label="Keyword", hint_text="Ví dụ: Moscow, Scotland, Alaska", expand=True)
+    chapter_amount = ft.TextField(
+        label="Số video", value="10", width=110,
+        input_filter=ft.InputFilter(allow=True, regex_string=r"[0-9]"))
+    chapter_download = ft.FilledButton(
+        "Tìm & tải", icon=ft.Icons.DOWNLOAD)
+    chapter_cancel = ft.OutlinedButton(
+        "Hủy", icon=ft.Icons.CANCEL, disabled=True)
+    chapter_keyword_edit = ft.OutlinedButton(
+        "Edit", icon=ft.Icons.EDIT, tooltip="Khóa keyword hiện tại")
+    chapter_keyword_states: dict[int, dict[str, object]] = {}
+    chapter_download_status = ft.Text(
+        "Video tải thành công sẽ được lưu vào Library và chapter này.",
+        size=12, color=ft.Colors.BLUE_GREY_400)
+    chapter_download_progress = ft.ProgressBar(value=0, visible=False, expand=True)
+    chapter_download_count = ft.Text(
+        "", size=12, color=ft.Colors.BLUE_GREY_300, visible=False)
+    chapter_cancel_event: Event | None = None
+    chapter_download_preview = ft.Column(
+        visible=False, spacing=5,
+        controls=[
+            chapter_video_settings,
+            ft.Row([chapter_keyword, chapter_amount, chapter_download, chapter_cancel,
+                    chapter_keyword_edit],
+                   vertical_alignment=ft.CrossAxisAlignment.END),
+            chapter_download_status,
+            ft.Row([chapter_download_progress, chapter_download_count], spacing=12,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        ],
+    )
+    project_chapter_keywords = ft.Column(visible=False, spacing=10)
+    project_batch_status = ft.Text(
+        "", size=12, weight=ft.FontWeight.W_600, color=ft.Colors.BLUE_200,
+        expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+    project_batch_progress = ft.ProgressBar(value=0, expand=True)
+    project_batch_count = ft.Text("0/0", size=12, color=ft.Colors.BLUE_GREY_300)
+    project_batch_log = ft.ListView(height=90, spacing=4, auto_scroll=True)
+    project_batch_log_toggle = ft.IconButton(
+        icon=ft.Icons.EXPAND_LESS, tooltip="Thu gọn nhật ký", icon_size=18,
+        visual_density=ft.VisualDensity.COMPACT)
+    project_batch_project_id: int | None = None
+    project_batch_panel = ft.Container(
+        visible=False, padding=ft.Padding.symmetric(horizontal=10, vertical=6),
+        border_radius=8, bgcolor="#10182c",
+        content=ft.Column(spacing=4, controls=[
+            ft.Row([
+                project_batch_status,
+                project_batch_count,
+                project_batch_log_toggle,
+            ], spacing=4, vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            project_batch_progress,
+            project_batch_log,
+        ]))
     project_grid = ft.GridView(expand=True, max_extent=350, child_aspect_ratio=1.17,
                                spacing=14, run_spacing=14)
     project_empty = ft.Text(visible=False, color=ft.Colors.BLUE_GREY_300)
@@ -1620,13 +1736,21 @@ async def main(page: ft.Page) -> None:
     visible_project_ids: set[int] = set()
     project_select_controls: dict[int, tuple[ft.IconButton, ft.Container]] = {}
     project_selected_count = ft.Text("0 đã chọn", size=12, color=ft.Colors.BLUE_GREY_300)
-    project_select_all = ft.IconButton(icon=ft.Icons.SELECT_ALL, tooltip="Chọn tất cả", disabled=True)
-    project_delete = ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, tooltip="Xóa video đã chọn", disabled=True)
-    project_save = ft.IconButton(icon=ft.Icons.DOWNLOAD, tooltip="Xuất video ra thư mục khác", disabled=True)
+    project_select_all = ft.IconButton(
+        icon=ft.Icons.SELECT_ALL, tooltip="Chọn tất cả", disabled=True,
+        icon_size=20, visual_density=ft.VisualDensity.COMPACT)
+    project_delete = ft.IconButton(
+        icon=ft.Icons.DELETE_OUTLINE, tooltip="Xóa video đã chọn", disabled=True,
+        icon_size=20, visual_density=ft.VisualDensity.COMPACT)
+    project_save = ft.IconButton(
+        icon=ft.Icons.DOWNLOAD, tooltip="Xuất video ra thư mục khác", disabled=True,
+        icon_size=20, visual_density=ft.VisualDensity.COMPACT)
     project_move = ft.IconButton(icon=ft.Icons.DRIVE_FILE_MOVE_OUTLINE,
-                                 tooltip="Gắn vào project/chapter", disabled=True)
+                                 tooltip="Gắn vào project/chapter", disabled=True,
+                                 icon_size=20, visual_density=ft.VisualDensity.COMPACT)
     edit_add_stock = ft.IconButton(icon=ft.Icons.CONTENT_CUT,
-                                   tooltip="Trim video đã chọn", disabled=True)
+                                   tooltip="Trim video đã chọn", disabled=True,
+                                   icon_size=20, visual_density=ft.VisualDensity.COMPACT)
     edit_status = ft.Text(size=12, color=ft.Colors.BLUE_GREY_300)
     edit_empty = ft.Text("Chưa có video trim. Chọn video ở tab Video stock rồi bấm nút Trim.",
                          color=ft.Colors.BLUE_GREY_300)
@@ -1642,6 +1766,7 @@ async def main(page: ft.Page) -> None:
                                 tooltip="Gỡ video đã chọn khỏi Edit", disabled=True)
     edit_trim_rows: dict[tuple[int, int | None], dict[int, dict]] = {}
     order_sequences: dict[tuple[int, int | None], list[int]] = {}
+    edit_scope_loaded: set[tuple[int, int | None]] = set()
     order_pool = ft.GridView(expand=True, max_extent=280, child_aspect_ratio=1.65,
                              spacing=10, run_spacing=10)
     order_list = ft.Column(expand=True, spacing=8, scroll=ft.ScrollMode.AUTO)
@@ -1650,7 +1775,8 @@ async def main(page: ft.Page) -> None:
                                  tooltip="Tải video theo thứ tự", disabled=True)
     order_random = ft.IconButton(icon=ft.Icons.SHUFFLE,
                                  tooltip="Order ngẫu nhiên từ kho bên trái", disabled=True)
-    order_thumbnail_cache: dict[str, bytes | None] = {}
+    order_thumbnail_cache: dict[str, tuple[tuple[int, int] | None, bytes | None]] = {}
+    trim_thumbnail_cache: dict[str, tuple[tuple[int, int] | None, bytes | None]] = {}
     active_order_drag: dict[str, int | str | None] = {"origin": None, "record_id": None}
     selected_project_id: int | None = None
     selected_chapter_id: int | None = None
@@ -1753,7 +1879,7 @@ async def main(page: ft.Page) -> None:
                                               fit=ft.StackFit.EXPAND)),
                 ft.Text(label, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
                         tooltip=label, weight=ft.FontWeight.W_600),
-                ft.Text(format_size(record["size_on_disk"]) if record["exists_on_disk"]
+                ft.Text(format_record_media_info(record) if record["exists_on_disk"]
                         else "Thiếu file MP4", size=12,
                         color=ft.Colors.BLUE_GREY_300 if record["exists_on_disk"]
                         else ft.Colors.AMBER_300),
@@ -1766,7 +1892,13 @@ async def main(page: ft.Page) -> None:
         path = Path(trim["trimmed_path"])
         duration_text = f"{float(trim['trim_duration']):.1f}".replace(".", ",")
         start_text = f"{float(trim['trim_start']):.1f}".replace(".", ",")
-        poster = thumbnail_bytes(path) if path.is_file() else None
+        cache_key = str(path)
+        fingerprint = media_file_fingerprint(path)
+        cached = trim_thumbnail_cache.get(cache_key)
+        if cached is None or cached[0] != fingerprint:
+            cached = (fingerprint, stored_thumbnail_bytes(path))
+            trim_thumbnail_cache[cache_key] = cached
+        poster = cached[1]
         image = (ft.Image(src=poster, fit=ft.BoxFit.COVER, expand=True) if poster
                  else ft.Container(expand=True, alignment=ft.Alignment(0, 0),
                                    content=ft.Icon(ft.Icons.CONTENT_CUT,
@@ -1788,7 +1920,8 @@ async def main(page: ft.Page) -> None:
                                               fit=ft.StackFit.EXPAND)),
                 ft.Text(f"Trim · {label}", max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
                         tooltip=label, weight=ft.FontWeight.W_600),
-                ft.Text(f"{duration_text}s · từ {start_text}s",
+                ft.Text(" · ".join(filter(None, [format_record_resolution(record),
+                                                  f"{duration_text}s · từ {start_text}s"])),
                         size=12, color=ft.Colors.AMBER_200),
             ]),
         )
@@ -1799,12 +1932,15 @@ async def main(page: ft.Page) -> None:
         path = Path(trim["trimmed_path"])
         label = record["details"].get("tags") or path.name
         cache_key = str(path)
-        if cache_key not in order_thumbnail_cache:
-            try:
-                order_thumbnail_cache[cache_key] = thumbnail_bytes(path) if path.is_file() else None
-            except OSError:
-                order_thumbnail_cache[cache_key] = None
-        poster = order_thumbnail_cache[cache_key]
+        fingerprint = media_file_fingerprint(path)
+        cached = order_thumbnail_cache.get(cache_key)
+        if cached is None or cached[0] != fingerprint:
+            trim_cached = trim_thumbnail_cache.get(cache_key)
+            poster = (trim_cached[1] if trim_cached and trim_cached[0] == fingerprint
+                      else stored_thumbnail_bytes(path))
+            cached = (fingerprint, poster)
+            order_thumbnail_cache[cache_key] = cached
+        poster = cached[1]
         preview = (ft.Image(src=poster, width=96, height=54, fit=ft.BoxFit.COVER)
                    if poster else ft.Icon(ft.Icons.MOVIE_OUTLINED,
                                           color=ft.Colors.AMBER_300))
@@ -2095,15 +2231,24 @@ async def main(page: ft.Page) -> None:
         update_edit_selection()
         edit_grid.visible = bool(edit_grid.controls)
         edit_empty.visible = not edit_grid.controls
-        render_order_layout()
 
-    async def reload_edit_scope(project_id: int, chapter_id: int | None) -> None:
-        rows = await asyncio.to_thread(database.list_edit_videos, project_id, chapter_id)
+    def invalidate_edit_scope(project_id: int, chapter_id: int | None) -> None:
+        edit_scope_loaded.discard((project_id, chapter_id))
+
+    def invalidate_all_edit_scopes() -> None:
+        edit_scope_loaded.clear()
+
+    async def reload_edit_scope(project_id: int, chapter_id: int | None,
+                                *, force: bool = False) -> None:
         key = (project_id, chapter_id)
+        if key in edit_scope_loaded and not force:
+            return
+        rows = await asyncio.to_thread(database.list_edit_videos, project_id, chapter_id)
         edit_sequences[key] = [row["video_record_id"] for row in rows]
         edit_trim_rows[key] = {row["video_record_id"]: row for row in rows}
         order_sequences[key] = await asyncio.to_thread(
             database.list_ordered_video_ids, project_id, chapter_id)
+        edit_scope_loaded.add(key)
 
     async def remove_selected_from_edit(_: ft.ControlEvent) -> None:
         if selected_project_id is None or not selected_edit_videos:
@@ -2112,6 +2257,7 @@ async def main(page: ft.Page) -> None:
         try:
             removed = await asyncio.to_thread(database.remove_edit_videos,
                                               sorted(selected_edit_videos), *key)
+            invalidate_edit_scope(*key)
             await reload_edit_scope(*key)
         except (ValueError, sqlite3.Error) as exc:
             edit_status.value = str(exc) or "Không thể gỡ video khỏi Edit."
@@ -2135,10 +2281,12 @@ async def main(page: ft.Page) -> None:
             page.update()
             return
         key = (selected_project_id, selected_chapter_id)
-        ordered_ids = [row["id"] for row in project_entries
-                       if row["id"] in selected_project_videos and row["id"] in visible_project_ids]
+        ordered_ids = list(dict.fromkeys(
+            row["id"] for row in project_entries
+            if row["id"] in selected_project_videos and row["id"] in visible_project_ids))
         try:
             added = await asyncio.to_thread(database.add_edit_videos, ordered_ids, *key)
+            invalidate_edit_scope(*key)
             await reload_edit_scope(*key)
         except (ValueError, sqlite3.Error) as exc:
             edit_status.value = str(exc) or "Không thể thêm video vào Edit."
@@ -2208,6 +2356,10 @@ async def main(page: ft.Page) -> None:
                         output, start_time, duration = await asyncio.to_thread(
                             trim_random_video, source, destination, min_seconds, max_seconds,
                             start_at=start_seconds)
+                        poster = await asyncio.to_thread(thumbnail_bytes, output)
+                        trim_thumbnail_cache[str(output)] = (
+                            media_file_fingerprint(output), poster)
+                        order_thumbnail_cache.pop(str(output), None)
                         await asyncio.to_thread(database.save_edit_trim, record_id, project_id,
                                                 chapter_id, output, start_time, duration)
                     return True
@@ -2233,6 +2385,7 @@ async def main(page: ft.Page) -> None:
                     edit_status.value = (f"Đang trim {position}/{len(chosen)} video "
                                          f"· {worker_count} luồng...")
                     page.update()
+                invalidate_edit_scope(project_id, chapter_id)
                 await reload_edit_scope(project_id, chapter_id)
                 render_edit_grid()
                 edit_status.value = f"Trim hoàn tất: {completed} thành công, {failed} lỗi."
@@ -2262,8 +2415,9 @@ async def main(page: ft.Page) -> None:
     async def prepare_trim_from_stock(_: ft.ControlEvent) -> None:
         if selected_project_id is None or not selected_project_videos:
             return
-        chosen = [row["id"] for row in project_entries
-                  if row["id"] in selected_project_videos and row["id"] in visible_project_ids]
+        chosen = list(dict.fromkeys(
+            row["id"] for row in project_entries
+            if row["id"] in selected_project_videos and row["id"] in visible_project_ids))
         await add_selected_to_edit(None)
         show_trim_setup(None, chosen)
 
@@ -2332,12 +2486,96 @@ async def main(page: ft.Page) -> None:
                                               fit=ft.StackFit.EXPAND)),
                 ft.Text(label, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
                         tooltip=label, weight=ft.FontWeight.W_600),
-                ft.Text(format_size(record["size_on_disk"]) if exists else "Thiếu file MP4",
+                ft.Text(format_record_media_info(record) if exists else "Thiếu file MP4",
                         size=12, color=ft.Colors.BLUE_GREY_300 if exists else ft.Colors.AMBER_300),
             ]),
         )
         project_select_controls[record["id"]] = (selector, container)
         return container
+
+    def chapter_keyword_state(chapter: dict) -> dict[str, object]:
+        return chapter_keyword_states.setdefault(
+            chapter["id"], {
+                "keyword": chapter.get("keyword", ""),
+                "locked": bool(chapter.get("keyword_locked", False)),
+            })
+
+    def render_project_chapter_keywords() -> None:
+        project_chapter_keywords.controls.clear()
+        if selected_project_id is None or selected_chapter_id is not None:
+            project_chapter_keywords.visible = False
+            return
+        project_chapter_keywords.visible = True
+        chapters = project_chapters.get(selected_project_id, [])
+        if not chapters:
+            project_chapter_keywords.controls.append(ft.Text(
+                "Project chưa có chapter. Hãy tạo chapter để thiết lập keyword.",
+                color=ft.Colors.BLUE_GREY_300))
+            return
+        for chapter in chapters:
+            state = chapter_keyword_state(chapter)
+            locked = bool(state["locked"])
+            field = ft.TextField(
+                label="Keyword", value=str(state["keyword"]), expand=True,
+                disabled=locked, text_style=None)
+            edit = ft.OutlinedButton(
+                "Edit", icon=ft.Icons.EDIT_OFF if locked else ft.Icons.EDIT,
+                tooltip="Cho phép sửa keyword" if locked else "Khóa keyword hiện tại")
+
+            async def update_keyword(_: ft.ControlEvent,
+                                     project_id: int = selected_project_id,
+                                     chapter_id: int = chapter["id"],
+                                     keyword_field: ft.TextField = field) -> None:
+                state = chapter_keyword_states[chapter_id]
+                state["keyword"] = keyword_field.value
+                try:
+                    await asyncio.to_thread(
+                        database.update_chapter_keyword, project_id, chapter_id,
+                        keyword_field.value, bool(state["locked"]))
+                except (sqlite3.Error, ValueError) as exc:
+                    state["locked"] = not locked_now
+                    keyword_field.disabled = not locked_now
+                    edit_button.icon = ft.Icons.EDIT_OFF if not locked_now else ft.Icons.EDIT
+                    edit_button.tooltip = (
+                        "Cho phép sửa keyword" if not locked_now else "Khóa keyword hiện tại")
+                    project_feedback.value = str(exc)
+                    project_feedback.color = ft.Colors.RED_300
+                    page.update()
+
+            async def toggle_keyword(_: ft.ControlEvent,
+                                     project_id: int = selected_project_id,
+                                     chapter_id: int = chapter["id"],
+                                     keyword_field: ft.TextField = field,
+                                     edit_button: ft.OutlinedButton = edit) -> None:
+                state = chapter_keyword_states[chapter_id]
+                state["keyword"] = keyword_field.value
+                state["locked"] = not bool(state["locked"])
+                locked_now = bool(state["locked"])
+                keyword_field.disabled = locked_now
+                keyword_field.text_style = None
+                edit_button.icon = ft.Icons.EDIT_OFF if locked_now else ft.Icons.EDIT
+                edit_button.tooltip = (
+                    "Cho phép sửa keyword" if locked_now else "Khóa keyword hiện tại")
+                page.update()
+                try:
+                    await asyncio.to_thread(
+                        database.update_chapter_keyword, project_id, chapter_id,
+                        keyword_field.value, bool(state["locked"]))
+                except (sqlite3.Error, ValueError) as exc:
+                    project_feedback.value = str(exc)
+                    project_feedback.color = ft.Colors.RED_300
+                    page.update()
+
+            field.on_change = update_keyword
+            edit.on_click = toggle_keyword
+            project_chapter_keywords.controls.append(ft.Container(
+                padding=ft.Padding.all(12), border_radius=10, bgcolor="#131c33",
+                content=ft.Row([
+                    ft.Text(chapter["title"], width=220, weight=ft.FontWeight.W_600,
+                            max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
+                            tooltip=chapter["title"]),
+                    field, edit,
+                ], vertical_alignment=ft.CrossAxisAlignment.END)))
 
     def render_project_grid() -> None:
         project = next((row for row in project_rows if row["id"] == selected_project_id), None)
@@ -2346,7 +2584,6 @@ async def main(page: ft.Page) -> None:
             project_select_controls.clear()
             visible_project_ids.clear()
             update_project_selection()
-            render_edit_grid()
             project_grid.visible = False
             project_empty.visible = True
             project_empty.value = "Chưa có project."
@@ -2354,6 +2591,16 @@ async def main(page: ft.Page) -> None:
         chapter = next((row for row in project_chapters.get(project["id"], [])
                         if row["id"] == selected_chapter_id), None)
         chapter_title.value = chapter["title"] if chapter else project["name"]
+        if chapter is None:
+            chapter_count.value = f"{len(project_chapters.get(project['id'], []))} chapter"
+            project_select_controls.clear()
+            visible_project_ids.clear()
+            project_grid.controls.clear()
+            update_project_selection()
+            project_grid.visible = False
+            project_empty.visible = False
+            render_project_chapter_keywords()
+            return
         visible_records = []
         seen_video_ids: set[int] = set()
         for row in project_entries:
@@ -2362,14 +2609,12 @@ async def main(page: ft.Page) -> None:
             if row["id"] not in seen_video_ids:
                 visible_records.append(row)
                 seen_video_ids.add(row["id"])
-        chapter_count.value = (f"{len(visible_records)} video · {len(project_chapters.get(project['id'], []))} chapter"
-                               if chapter is None else f"{len(visible_records)} video trong chapter")
+        chapter_count.value = f"{len(visible_records)} video trong chapter"
         project_select_controls.clear()
         visible_project_ids.clear()
         visible_project_ids.update(row["id"] for row in visible_records)
         project_grid.controls[:] = [project_video_card(record) for record in visible_records]
         update_project_selection()
-        render_edit_grid()
         project_grid.visible = bool(visible_records)
         project_empty.visible = not visible_records
         project_empty.value = ("Chapter này chưa có video. Gắn video từ Download hoặc Library."
@@ -2415,6 +2660,7 @@ async def main(page: ft.Page) -> None:
                     await asyncio.to_thread(database.delete_chapter, project_id, chapter_id)
                     if selected_project_id == project_id and selected_chapter_id == chapter_id:
                         selected_chapter_id = None
+                invalidate_all_edit_scopes()
                 project_entry_cache.pop(project_id, None)
                 if await refresh_projects():
                     project_feedback.value = f"Đã xóa {kind} \"{name}\". Video vẫn ở Library."
@@ -2518,12 +2764,33 @@ async def main(page: ft.Page) -> None:
             return
         selected_project_id = project_id
         selected_chapter_id = chapter_id
+        if project_batch_project_id is not None and project_batch_project_id != project_id:
+            project_batch_panel.visible = False
         expanded_projects.add(project_id)
         selection_version += 1
         version = selection_version
         chapter_name.disabled = False
         chapter_create.disabled = False
+        project_batch_download.disabled = chapter_id is not None
+        project_batch_trim.disabled = chapter_id is not None
+        project_run_sequence.disabled = chapter_id is not None
+        chapter_create_row.visible = chapter_id is None
+        chapter_feedback.visible = chapter_id is None
+        chapter_download_preview.visible = chapter_id is not None
+        chapter_tabs.visible = chapter_id is not None
+        project_chapter_keywords.visible = chapter_id is None
+        if chapter_id is not None:
+            chapter_row = next(row for row in chapters if row["id"] == chapter_id)
+            state = chapter_keyword_state(chapter_row)
+            chapter_keyword.value = str(state["keyword"])
+            locked = bool(state["locked"])
+            chapter_keyword.disabled = locked
+            chapter_keyword.text_style = None
+            chapter_keyword_edit.icon = ft.Icons.EDIT_OFF if locked else ft.Icons.EDIT
+            chapter_keyword_edit.tooltip = (
+                "Cho phép sửa keyword" if locked else "Khóa keyword hiện tại")
         render_project_sidebar()
+        render_project_chapter_keywords()
         if force_reload or project_id not in project_entry_cache:
             chapter_title.value = next((row["title"] for row in chapters if row["id"] == chapter_id),
                                        project["name"])
@@ -2546,14 +2813,20 @@ async def main(page: ft.Page) -> None:
                 return
             project_entry_cache[project_id] = entries
         project_entries = project_entry_cache[project_id]
-        try:
-            await reload_edit_scope(project_id, chapter_id)
-        except sqlite3.Error:
-            edit_sequences[(project_id, chapter_id)] = []
-            edit_trim_rows[(project_id, chapter_id)] = {}
-            edit_status.value = "Không thể nạp danh sách video Edit."
-            edit_status.color = ft.Colors.RED_300
+        active_tab = int(chapter_tabs.selected_index or 0)
+        if active_tab in (1, 2):
+            try:
+                await reload_edit_scope(project_id, chapter_id)
+            except sqlite3.Error:
+                edit_sequences[(project_id, chapter_id)] = []
+                edit_trim_rows[(project_id, chapter_id)] = {}
+                edit_status.value = "Không thể nạp danh sách video Edit."
+                edit_status.color = ft.Colors.RED_300
         render_project_grid()
+        if active_tab == 1:
+            render_edit_grid()
+        elif active_tab == 2:
+            render_order_layout()
         page.update()
 
     async def refresh_project_sidebar() -> None:
@@ -2589,6 +2862,14 @@ async def main(page: ft.Page) -> None:
                 chapter_count.value = "Các chapter của project sẽ xuất hiện ở đây."
                 chapter_name.disabled = True
                 chapter_create.disabled = True
+                project_batch_download.disabled = True
+                project_batch_trim.disabled = True
+                project_run_sequence.disabled = True
+                chapter_create_row.visible = True
+                chapter_feedback.visible = True
+                chapter_download_preview.visible = False
+                project_chapter_keywords.visible = False
+                chapter_tabs.visible = False
                 render_project_grid()
             else:
                 chapter_id = (selected_chapter_id if target == selected_project_id and
@@ -2654,10 +2935,1086 @@ async def main(page: ft.Page) -> None:
             chapter_create.disabled = selected_project_id is None
             page.update()
 
+    async def begin_chapter_download(
+            _: ft.ControlEvent | None, *, batch_run: bool = False,
+            target_project_id: int | None = None,
+            target_chapter_id: int | None = None,
+            target_keyword: str | None = None,
+            target_amount: int | None = None) -> dict | None:
+        """Download unseen Library videos and attach completed records to this chapter."""
+        nonlocal chapter_cancel_event, library_loaded
+        if chapter_download.disabled and not batch_run:
+            return None
+        project_id = (target_project_id if batch_run and target_project_id is not None
+                      else selected_project_id)
+        chapter_id = (target_chapter_id if batch_run and target_chapter_id is not None
+                      else selected_chapter_id)
+        if project_id is None or chapter_id is None:
+            return None
+        term = (target_keyword if batch_run and target_keyword is not None
+                else chapter_keyword.value).strip()
+        chapter_keyword_states.setdefault(
+            chapter_id, {"keyword": "", "locked": False})["keyword"] = term
+        terms = [part.strip() for part in term.split(",") if part.strip()]
+        try:
+            per_keyword_count = int(
+                target_amount if batch_run and target_amount is not None
+                else chapter_amount.value)
+            if not terms or not 1 <= per_keyword_count <= 200:
+                raise ValueError
+        except (TypeError, ValueError):
+            chapter_download_status.value = (
+                "Keyword không được trống; số lượng phải từ 1 đến 200.")
+            chapter_download_status.color = ft.Colors.RED_300
+            page.update()
+            return None
+
+        source_dropdown = getattr(chapter_video_settings, "source_dropdown", None)
+        method_dropdown = getattr(chapter_video_settings, "method_dropdown", None)
+        source_name = ((source_dropdown.value if source_dropdown else None)
+                       or chapter_video_preferences.get("source", "pexels")).lower()
+        method_name = ((method_dropdown.value if method_dropdown else None)
+                       or chapter_video_preferences.get("method", "direct")).lower()
+        chapter_video_preferences["source"] = source_name
+        chapter_video_preferences["method"] = method_name
+        if method_name == "direct" and source_name != "pexels":
+            chapter_download_status.value = (
+                "Crawl trực tiếp chỉ hỗ trợ Pexels. Hãy chọn Pexels hoặc Crawl by API.")
+            chapter_download_status.color = ft.Colors.AMBER_300
+            page.update()
+            return None
+        pexels_key = configured_pexels_api_key() if source_name == "pexels" else ""
+        if method_name == "api" and source_name == "pexels" and not pexels_key:
+            chapter_download_status.value = (
+                "Hãy nhập Pexels API key trong Setup trước khi tải.")
+            chapter_download_status.color = ft.Colors.RED_300
+            page.update()
+            return None
+
+        requested_count = per_keyword_count * len(terms)
+        chapter_download.disabled = True
+        chapter_cancel.disabled = False
+        chapter_cancel_event = Event()
+        cancel = chapter_cancel_event
+        chapter_download_progress.visible = True
+        chapter_download_progress.value = None
+        chapter_download_count.visible = True
+        chapter_download_count.value = f"0/{requested_count}"
+        chapter_download_status.value = "Đang tìm video mới chưa có trong Library..."
+        chapter_download_status.color = ft.Colors.BLUE_200
+        page.update()
+
+        batch = database.batch()
+        owner = batch.__enter__()
+        selected_videos: list[Video] = []
+        keyword_failures: list[dict[str, str | int]] = []
+        failed = 0
+        try:
+            queue: asyncio.Queue[DownloadEvent] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def report(event: DownloadEvent) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+
+            requested_workers = selected_worker_count(
+                chapter_video_settings, chapter_video_preferences)
+            active_workers = keyword_worker_count(len(terms), requested_workers)
+            chapter_download_status.value = (
+                f"Đang chạy {active_workers} luồng cho {len(terms)} keyword "
+                f"(mỗi keyword 1 luồng)...")
+            page.update()
+
+            if method_name == "direct":
+                def search_direct() -> tuple[list[Video], list[dict[str, str | int]]]:
+                    def process_term(active_term: str) -> list[Video]:
+                        if cancel.is_set():
+                            return []
+                        term_videos: list[Video] = []
+                        attempted_ids: set[int] = set()
+
+                        def accept_batch(candidates: list[Video]) -> bool:
+                            fresh = [candidate for candidate in candidates
+                                     if candidate.id not in attempted_ids]
+                            attempted_ids.update(candidate.id for candidate in fresh)
+                            if not fresh or cancel.is_set():
+                                return cancel.is_set()
+                            matched, _, _, _ = download_matching_pexels_videos(
+                                fresh, per_keyword_count - len(term_videos),
+                                LIBRARY_ROOT, active_term,
+                                chapter_video_preferences["orientation"], cancel,
+                                database, owner, report, workers=1,
+                                quality=chapter_video_preferences["quality"])
+                            term_videos.extend(matched)
+                            return cancel.is_set() or len(term_videos) >= per_keyword_count
+
+                        search_pexels_videos_direct(
+                            active_term, per_keyword_count, cancel,
+                            exclude_ids=attempted_ids, on_batch=accept_batch,
+                            orientation=chapter_video_preferences["orientation"],
+                            quality=chapter_video_preferences["quality"])
+                        return term_videos
+
+                    accepted: list[Video] = []
+                    failures: list[dict[str, str | int]] = []
+                    with ThreadPoolExecutor(
+                            max_workers=active_workers,
+                            thread_name_prefix="chapter-direct-keyword") as executor:
+                        futures = {
+                            executor.submit(process_term, active_term): (index, active_term)
+                            for index, active_term in enumerate(terms, start=1)
+                        }
+                        for future in as_completed(futures):
+                            index, active_term = futures[future]
+                            try:
+                                term_videos = future.result()
+                                accepted.extend(term_videos)
+                            except Exception as exc:
+                                failures.append({
+                                    "keyword": active_term,
+                                    "keyword_index": index,
+                                    "error_type": type(exc).__name__,
+                                    "message": str(exc),
+                                })
+                                record_diagnostic(
+                                    stage="chapter_keyword", kind="error",
+                                    chapter_id=chapter_id, keyword_index=index,
+                                    error_type=type(exc).__name__)
+                    failures.sort(key=lambda item: int(item["keyword_index"]))
+                    return accepted, failures
+
+                worker = asyncio.create_task(asyncio.to_thread(search_direct))
+            else:
+                api_pool = get_api_key_pool() if source_name == "pixabay" else None
+
+                def search_and_download_api(
+                ) -> tuple[list[Video], list[dict[str, str | int]]]:
+                    def process_term(active_term: str) -> list[Video]:
+                        if cancel.is_set():
+                            return []
+                        if source_name == "pexels":
+                            videos = select_pexels_unique(
+                                pexels_key, active_term, per_keyword_count, LIBRARY_ROOT,
+                                database, owner, cancel,
+                                quality=chapter_video_preferences["quality"],
+                                orientation=chapter_video_preferences["orientation"])
+                        else:
+                            videos = select_unique(
+                                api_pool, active_term, per_keyword_count, LIBRARY_ROOT,
+                                database, owner, cancel,
+                                quality=chapter_video_preferences["quality"],
+                                orientation=chapter_video_preferences["orientation"])
+                        if videos:
+                            download_many(
+                                videos, LIBRARY_ROOT, active_term, cancel, report,
+                                database, owner, workers=1)
+                        return videos
+
+                    videos: list[Video] = []
+                    failures: list[dict[str, str | int]] = []
+                    with ThreadPoolExecutor(
+                            max_workers=active_workers,
+                            thread_name_prefix="chapter-keyword") as executor:
+                        futures = {
+                            executor.submit(process_term, active_term): (index, active_term)
+                            for index, active_term in enumerate(terms, start=1)
+                        }
+                        for future in as_completed(futures):
+                            index, active_term = futures[future]
+                            try:
+                                term_videos = future.result()
+                                videos.extend(term_videos)
+                            except Exception as exc:
+                                failures.append({
+                                    "keyword": active_term,
+                                    "keyword_index": index,
+                                    "error_type": type(exc).__name__,
+                                    "message": str(exc),
+                                })
+                                record_diagnostic(
+                                    stage="chapter_keyword", kind="error",
+                                    chapter_id=chapter_id, keyword_index=index,
+                                    error_type=type(exc).__name__)
+                    failures.sort(key=lambda item: int(item["keyword_index"]))
+                    return videos, failures
+
+                worker = asyncio.create_task(asyncio.to_thread(search_and_download_api))
+
+            completed = 0
+            while not worker.done() or not queue.empty():
+                try:
+                    first_event = await asyncio.wait_for(queue.get(), timeout=0.15)
+                except TimeoutError:
+                    continue
+                events = [first_event]
+                while not queue.empty():
+                    events.append(queue.get_nowait())
+                for event in events:
+                    if event.state in {"done", "verified", "error", "cancelled", "rejected"}:
+                        completed += 1
+                    failed += event.state == "error"
+                chapter_download_progress.value = min(1, completed / requested_count)
+                chapter_download_count.value = f"{min(completed, requested_count)}/{requested_count}"
+                chapter_download_status.value = (
+                    f"Đang tải và kiểm tra video {min(completed, requested_count)}/{requested_count}...")
+                page.update()
+
+            selected_videos, keyword_failures = await worker
+            records = await asyncio.to_thread(
+                database.source_video_records,
+                [(video.source, video.id) for video in selected_videos])
+            record_ids = [record["id"] for record in records]
+            attached = await asyncio.to_thread(
+                database.assign_videos, record_ids, project_id, chapter_id)
+            linked_records = await asyncio.to_thread(database.list_project_videos, project_id)
+            linked_ids = {
+                row["id"] for row in linked_records if row["chapter_id"] == chapter_id
+            }
+            missing_ids = set(record_ids) - linked_ids
+            if missing_ids:
+                raise sqlite3.IntegrityError(
+                    f"Không thể gắn {len(missing_ids)} video vào chapter {chapter_id}.")
+            library_loaded = False
+            project_entry_cache.pop(project_id, None)
+            if selected_project_id == project_id and selected_chapter_id == chapter_id:
+                await select_project(project_id, chapter_id, force_reload=True)
+            saved = len(record_ids)
+            if cancel.is_set():
+                chapter_download_status.value = (
+                    f"Đã hủy. Giữ lại {saved} video hoàn tất và gắn vào chapter.")
+                chapter_download_status.color = ft.Colors.AMBER_300
+            elif not saved and keyword_failures:
+                chapter_download_status.value = (
+                    f"Không tải được video; {len(keyword_failures)}/{len(terms)} keyword lỗi.")
+                chapter_download_status.color = ft.Colors.RED_300
+            elif not saved:
+                chapter_download_status.value = (
+                    "Không tìm thấy video mới phù hợp; các video trùng Library đã được bỏ qua.")
+                chapter_download_status.color = ft.Colors.AMBER_300
+            elif keyword_failures or failed:
+                chapter_download_status.value = (
+                    f"Đã lưu {saved} video vào Library và chapter; "
+                    f"{len(keyword_failures)}/{len(terms)} keyword lỗi"
+                    + (f", {failed} lượt tải lỗi." if failed else "."))
+                chapter_download_status.color = ft.Colors.AMBER_300
+            else:
+                chapter_download_status.value = (
+                    f"Hoàn tất: {saved} video mới đã lưu vào Library và chapter"
+                    f" ({attached} liên kết mới).")
+                chapter_download_status.color = ft.Colors.GREEN_300
+            outcome = {
+                "saved": saved,
+                "attached": attached,
+                "chapter_id": chapter_id,
+                "cancelled": cancel.is_set(),
+                "keyword_total": len(terms),
+                "keyword_failures": keyword_failures,
+                "message": chapter_download_status.value,
+                "has_errors": bool(keyword_failures or failed),
+            }
+            record_diagnostic(
+                stage="chapter_download",
+                kind=("partial_success" if keyword_failures and saved
+                      else "error" if keyword_failures else "success"),
+                chapter_id=chapter_id, status=saved)
+            return outcome
+        except (PixabayError, PexelsError, PexelsBrowserSearchError,
+                PexelsLinkError, OSError, sqlite3.Error, ValueError) as exc:
+            chapter_download_status.value = str(exc)
+            chapter_download_status.color = ft.Colors.RED_300
+            record_diagnostic(
+                stage="chapter_download", kind="error", chapter_id=chapter_id,
+                error_type=type(exc).__name__)
+            return {
+                "saved": 0, "attached": 0, "chapter_id": chapter_id,
+                "cancelled": cancel.is_set(), "keyword_total": len(terms),
+                "keyword_failures": keyword_failures,
+                "message": chapter_download_status.value, "has_errors": True,
+            }
+        except Exception as exc:
+            chapter_download_status.value = f"Lỗi khi tải video vào chapter: {exc}"
+            chapter_download_status.color = ft.Colors.RED_300
+            record_diagnostic(
+                stage="chapter_download", kind="error", chapter_id=chapter_id,
+                error_type=type(exc).__name__)
+            return {
+                "saved": 0, "attached": 0, "chapter_id": chapter_id,
+                "cancelled": cancel.is_set(), "keyword_total": len(terms),
+                "keyword_failures": keyword_failures,
+                "message": chapter_download_status.value, "has_errors": True,
+            }
+        finally:
+            batch.__exit__(None, None, None)
+            chapter_download.disabled = False
+            chapter_cancel.disabled = True
+            chapter_download_progress.visible = False
+            chapter_download_count.visible = False
+            page.update()
+
+    def cancel_chapter_download(_: ft.ControlEvent) -> None:
+        if chapter_cancel_event:
+            chapter_cancel_event.set()
+            chapter_cancel.disabled = True
+            chapter_download_status.value = "Đang hủy các video chưa hoàn tất..."
+            chapter_download_status.color = ft.Colors.AMBER_300
+            page.update()
+
+    async def remember_chapter_keyword(_: ft.ControlEvent) -> None:
+        project_id = selected_project_id
+        chapter_id = selected_chapter_id
+        if project_id is not None and chapter_id is not None:
+            state = chapter_keyword_states.setdefault(
+                chapter_id, {"keyword": "", "locked": False})
+            state["keyword"] = chapter_keyword.value
+            try:
+                await asyncio.to_thread(
+                    database.update_chapter_keyword, project_id, chapter_id,
+                    chapter_keyword.value, bool(state["locked"]))
+            except (sqlite3.Error, ValueError) as exc:
+                chapter_download_status.value = str(exc)
+                chapter_download_status.color = ft.Colors.RED_300
+                page.update()
+
+    async def toggle_chapter_keyword_edit(_: ft.ControlEvent) -> None:
+        chapter_id = selected_chapter_id
+        project_id = selected_project_id
+        if chapter_id is None or project_id is None:
+            return
+        state = chapter_keyword_states.setdefault(
+            chapter_id, {"keyword": "", "locked": False})
+        state["keyword"] = chapter_keyword.value
+        state["locked"] = not bool(state["locked"])
+        locked = bool(state["locked"])
+        chapter_keyword.disabled = locked
+        chapter_keyword.text_style = None
+        chapter_keyword_edit.icon = ft.Icons.EDIT_OFF if locked else ft.Icons.EDIT
+        chapter_keyword_edit.tooltip = (
+            "Cho phép sửa keyword" if locked else "Khóa keyword hiện tại")
+        page.update()
+        try:
+            await asyncio.to_thread(
+                database.update_chapter_keyword, project_id, chapter_id,
+                str(state["keyword"]), locked)
+        except (sqlite3.Error, ValueError) as exc:
+            state["locked"] = not locked
+            chapter_keyword.disabled = not locked
+            chapter_keyword.text_style = None
+            chapter_keyword_edit.icon = ft.Icons.EDIT_OFF if not locked else ft.Icons.EDIT
+            chapter_download_status.value = str(exc)
+            chapter_download_status.color = ft.Colors.RED_300
+            page.update()
+
+    def toggle_project_batch_log(_: ft.ControlEvent) -> None:
+        project_batch_log.visible = not project_batch_log.visible
+        project_batch_log_toggle.icon = (
+            ft.Icons.EXPAND_LESS if project_batch_log.visible else ft.Icons.EXPAND_MORE)
+        project_batch_log_toggle.tooltip = (
+            "Thu gọn nhật ký" if project_batch_log.visible else "Mở rộng nhật ký")
+        page.update()
+
+    def show_project_batch_download(_: ft.ControlEvent) -> None:
+        project_id = selected_project_id
+        if project_id is None or selected_chapter_id is not None:
+            return
+        chapters = project_chapters.get(project_id, [])
+        if not chapters:
+            project_feedback.value = "Project chưa có chapter để tải."
+            project_feedback.color = ft.Colors.AMBER_300
+            page.update()
+            return
+
+        chapter_choice = ft.Dropdown(
+            label="Chapter", value="all", width=360,
+            options=[ft.DropdownOption(key="all", text="All"), *[
+                ft.DropdownOption(key=str(row["id"]), text=row["title"])
+                for row in chapters
+            ]])
+        amount = ft.TextField(
+            label="Số lượng video trên mỗi keyword", value="10", width=360,
+            input_filter=ft.InputFilter(allow=True, regex_string=r"[0-9]"))
+        feedback = ft.Text(size=12, color=ft.Colors.RED_300)
+
+        def close_dialog(_: ft.ControlEvent | None = None) -> None:
+            page.pop_dialog()
+
+        async def start_batch(_: ft.ControlEvent) -> None:
+            nonlocal chapter_cancel_event, project_batch_project_id
+            try:
+                per_keyword_count = int(amount.value)
+                if not 1 <= per_keyword_count <= 200:
+                    raise ValueError
+            except (TypeError, ValueError):
+                feedback.value = "Số lượng video phải từ 1 đến 200."
+                page.update()
+                return
+
+            target_chapters = (chapters if chapter_choice.value == "all" else [
+                row for row in chapters if str(row["id"]) == chapter_choice.value
+            ])
+            if not target_chapters:
+                feedback.value = "Hãy chọn chapter cần tải."
+                page.update()
+                return
+
+            close_dialog()
+            project_batch_download.disabled = True
+            project_batch_trim.disabled = True
+            project_run_sequence.disabled = True
+            processed = skipped = succeeded = issues = partial = 0
+            total = len(target_chapters)
+            project_batch_log.controls.clear()
+            project_batch_log.visible = True
+            project_batch_log_toggle.icon = ft.Icons.EXPAND_LESS
+            project_batch_log_toggle.tooltip = "Thu gọn nhật ký"
+            project_batch_project_id = project_id
+            project_batch_panel.visible = True
+            project_batch_progress.value = 0
+            project_batch_count.value = f"0/{total} chapter"
+            project_batch_status.value = f"Chuẩn bị tải {total} chapter..."
+            project_batch_status.color = ft.Colors.BLUE_200
+            page.update()
+            try:
+                for index, chapter in enumerate(target_chapters, start=1):
+                    state = chapter_keyword_state(chapter)
+                    keyword_text = str(state["keyword"]).strip()
+                    keyword_count = len([
+                        value for value in (part.strip() for part in keyword_text.split(","))
+                        if value
+                    ])
+                    if not keyword_text:
+                        skipped += 1
+                        project_batch_log.controls.append(ft.Text(
+                            f"⊘ {chapter['title']}: bỏ qua vì chưa có keyword.",
+                            size=12, color=ft.Colors.AMBER_300))
+                        project_batch_progress.value = index / total
+                        project_batch_count.value = f"{index}/{total} chapter"
+                        page.update()
+                        continue
+                    project_batch_status.value = (
+                        f"Đang chạy chapter {index}/{total}: {chapter['title']}")
+                    project_batch_log.controls.append(ft.Text(
+                        f"▶ {chapter['title']}: bắt đầu {keyword_count} keyword, "
+                        f"{per_keyword_count} video/keyword.",
+                        size=12, color=ft.Colors.BLUE_200))
+                    project_feedback.value = (
+                        f"Đang tải hàng loạt {index}/{total}: {chapter['title']}...")
+                    project_feedback.color = ft.Colors.BLUE_200
+                    page.update()
+                    chapter_cancel_event = None
+                    result = await begin_chapter_download(
+                        None, batch_run=True,
+                        target_project_id=project_id,
+                        target_chapter_id=chapter["id"],
+                        target_keyword=keyword_text,
+                        target_amount=per_keyword_count)
+                    if result is not None:
+                        processed += 1
+                    cancelled = chapter_cancel_event is not None and chapter_cancel_event.is_set()
+                    successful = bool(result and result["saved"] > 0)
+                    chapter_issue = bool(result and result.get("has_errors"))
+                    if successful:
+                        succeeded += 1
+                    if chapter_issue and successful:
+                        partial += 1
+                    elif not successful:
+                        issues += 1
+                    project_batch_log.controls.append(ft.Text(
+                        f"{'■' if cancelled else ('⚠' if chapter_issue or not successful else '✓')} "
+                        f"{chapter['title']}: "
+                        f"{result['message'] if result else 'Không nhận được kết quả tải.'}",
+                        size=12,
+                        color=(ft.Colors.AMBER_300 if cancelled or chapter_issue or not successful
+                               else chapter_download_status.color)))
+                    if result:
+                        for keyword_failure in result.get("keyword_failures", []):
+                            project_batch_log.controls.append(ft.Text(
+                                f"   ⚠ Keyword {keyword_failure['keyword_index']} "
+                                f"({keyword_failure['keyword']}): "
+                                f"{keyword_failure['error_type']} — "
+                                f"{keyword_failure['message']}",
+                                size=11, color=ft.Colors.AMBER_300))
+                    project_batch_progress.value = index / total
+                    project_batch_count.value = f"{index}/{total} chapter"
+                    page.update()
+                    if cancelled:
+                        break
+            finally:
+                await select_project(project_id, None)
+                project_batch_download.disabled = False
+                project_batch_trim.disabled = False
+                project_run_sequence.disabled = False
+                if chapter_cancel_event is not None and chapter_cancel_event.is_set():
+                    project_batch_status.value = (
+                        f"Đã hủy tại chapter {processed}/{total}.")
+                    project_batch_status.color = ft.Colors.AMBER_300
+                    project_feedback.value = (
+                        f"Đã hủy tải hàng loạt sau {processed}/{total} chapter.")
+                    project_feedback.color = ft.Colors.AMBER_300
+                else:
+                    project_batch_progress.value = 1
+                    project_batch_count.value = f"{total}/{total} chapter"
+                    project_batch_status.value = (
+                        f"Hoàn tất: {succeeded} chapter có video, {issues} không có video/lỗi"
+                        + (f", {partial} chapter có keyword lỗi" if partial else "")
+                        + (f", {skipped} chưa có keyword." if skipped else "."))
+                    project_batch_status.color = (
+                        ft.Colors.AMBER_300 if issues or partial or skipped else ft.Colors.GREEN_300)
+                    project_feedback.value = (
+                        f"Tải hàng loạt: {succeeded}/{total} chapter có video"
+                        + (f", {issues} không có video/lỗi" if issues else "")
+                        + (f", {skipped} chưa có keyword." if skipped else "."))
+                    project_feedback.color = (
+                        ft.Colors.AMBER_300 if issues or skipped else ft.Colors.GREEN_300)
+                page.update()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Tải video hàng loạt"),
+            content=ft.Column(
+                tight=True, spacing=12,
+                controls=[chapter_choice, amount, feedback]),
+            actions=[
+                ft.TextButton("Hủy", on_click=close_dialog),
+                ft.FilledButton("Bắt đầu tải", icon=ft.Icons.DOWNLOAD,
+                                on_click=start_batch),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        ))
+
+    def show_project_batch_trim(_: ft.ControlEvent) -> None:
+        project_id = selected_project_id
+        if project_id is None or selected_chapter_id is not None:
+            return
+        chapters = project_chapters.get(project_id, [])
+        if not chapters:
+            project_feedback.value = "Project chưa có chapter để trim."
+            project_feedback.color = ft.Colors.AMBER_300
+            page.update()
+            return
+
+        chapter_choice = ft.Dropdown(
+            label="Chapter", value="all", width=360,
+            options=[ft.DropdownOption(key="all", text="All"), *[
+                ft.DropdownOption(key=str(row["id"]), text=row["title"])
+                for row in chapters
+            ]])
+        minimum = ft.TextField(label="Min duration (s)", value="5,0", width=175,
+                               keyboard_type=ft.KeyboardType.NUMBER)
+        maximum = ft.TextField(label="Max duration (s)", value="6,0", width=175,
+                               keyboard_type=ft.KeyboardType.NUMBER)
+        start_from = ft.TextField(label="Bắt đầu từ (s)", value="2,0", width=175,
+                                  keyboard_type=ft.KeyboardType.NUMBER)
+        trim_workers = ft.Dropdown(
+            label="Số luồng trim", value="4", width=175,
+            options=[ft.DropdownOption(key=str(value), text=str(value))
+                     for value in range(1, 11)])
+        feedback = ft.Text(size=12, color=ft.Colors.RED_300)
+
+        def close_dialog(_: ft.ControlEvent | None = None) -> None:
+            page.pop_dialog()
+
+        async def start_batch_trim(_: ft.ControlEvent) -> None:
+            try:
+                min_seconds = round(float((minimum.value or "").replace(",", ".")), 1)
+                max_seconds = round(float((maximum.value or "").replace(",", ".")), 1)
+                start_seconds = round(float((start_from.value or "").replace(",", ".")), 3)
+                requested_workers = max(1, min(10, int(trim_workers.value or "1")))
+                if min_seconds <= 0 or max_seconds < min_seconds or start_seconds < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                feedback.value = ("Mốc bắt đầu phải từ 0 giây; Duration phải lớn hơn 0 "
+                                  "và Max phải lớn hơn hoặc bằng Min.")
+                page.update()
+                return
+
+            targets = (chapters if chapter_choice.value == "all" else [
+                row for row in chapters if str(row["id"]) == chapter_choice.value
+            ])
+            if not targets:
+                feedback.value = "Hãy chọn chapter cần trim."
+                page.update()
+                return
+
+            close_dialog()
+            project_batch_trim.disabled = True
+            project_batch_download.disabled = True
+            project_run_sequence.disabled = True
+            completed = failed = skipped = 0
+            try:
+                all_records = await asyncio.to_thread(database.list_project_videos, project_id)
+                for index, chapter in enumerate(targets, start=1):
+                    chapter_id = chapter["id"]
+                    records = {
+                        row["id"]: row for row in all_records
+                        if row["chapter_id"] == chapter_id
+                    }
+                    if not records:
+                        skipped += 1
+                        project_feedback.value = (
+                            f"Trim {index}/{len(targets)}: {chapter['title']} không có video, bỏ qua.")
+                        project_feedback.color = ft.Colors.AMBER_300
+                        page.update()
+                        continue
+
+                    record_ids = list(records)
+                    await asyncio.to_thread(
+                        database.add_edit_videos, record_ids, project_id, chapter_id)
+                    worker_count = min(len(record_ids), requested_workers)
+                    semaphore = asyncio.Semaphore(worker_count)
+
+                    async def trim_one(record_id: int) -> bool:
+                        record = records[record_id]
+                        source = Path(record["file_path"])
+                        destination = (ROOT / "edits" / str(project_id) / str(chapter_id)
+                                       / f"{record_id}_trimmed.mp4")
+                        try:
+                            async with semaphore:
+                                output, start_time, duration = await asyncio.to_thread(
+                                    trim_random_video, source, destination,
+                                    min_seconds, max_seconds, start_at=start_seconds)
+                                poster = await asyncio.to_thread(thumbnail_bytes, output)
+                                trim_thumbnail_cache[str(output)] = (
+                                    media_file_fingerprint(output), poster)
+                                order_thumbnail_cache.pop(str(output), None)
+                                await asyncio.to_thread(
+                                    database.save_edit_trim, record_id, project_id, chapter_id,
+                                    output, start_time, duration)
+                            return True
+                        except Exception as exc:
+                            try:
+                                await asyncio.to_thread(
+                                    database.save_edit_trim_error, record_id,
+                                    project_id, chapter_id, str(exc))
+                            except sqlite3.Error:
+                                pass
+                            return False
+
+                    tasks = [asyncio.create_task(trim_one(record_id))
+                             for record_id in record_ids]
+                    chapter_completed = chapter_failed = 0
+                    for position, task in enumerate(asyncio.as_completed(tasks), start=1):
+                        if await task:
+                            chapter_completed += 1
+                            completed += 1
+                        else:
+                            chapter_failed += 1
+                            failed += 1
+                        project_feedback.value = (
+                            f"Đang trim chapter {index}/{len(targets)}: {chapter['title']} · "
+                            f"{position}/{len(record_ids)} video · {worker_count} luồng...")
+                        project_feedback.color = ft.Colors.BLUE_200
+                        page.update()
+                    invalidate_edit_scope(project_id, chapter_id)
+                    record_diagnostic(
+                        stage="chapter_batch_trim",
+                        kind="success" if not chapter_failed else "partial_success",
+                        chapter_id=chapter_id, status=chapter_completed)
+
+                project_feedback.value = (
+                    f"Trim hàng loạt hoàn tất: {completed} thành công, {failed} lỗi"
+                    + (f", {skipped} chapter trống." if skipped else "."))
+                project_feedback.color = (
+                    ft.Colors.GREEN_300 if not failed and not skipped else ft.Colors.AMBER_300)
+                project_entry_cache.pop(project_id, None)
+                await select_project(project_id, None, force_reload=True)
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                project_feedback.value = f"Không thể trim hàng loạt: {exc}"
+                project_feedback.color = ft.Colors.RED_300
+            finally:
+                project_batch_trim.disabled = False
+                project_batch_download.disabled = False
+                project_run_sequence.disabled = False
+                page.update()
+
+        page.show_dialog(ft.AlertDialog(
+            modal=True, title=ft.Text("Trim video hàng loạt"),
+            content=ft.Container(width=370, content=ft.Column(
+                tight=True, spacing=12, controls=[
+                    chapter_choice,
+                    ft.Row([minimum, maximum]),
+                    ft.Row([start_from, trim_workers]),
+                    ft.Text("All sẽ trim toàn bộ video lần lượt qua từng chapter.",
+                            size=12, color=ft.Colors.BLUE_GREY_300),
+                    feedback,
+                ])),
+            actions=[
+                ft.TextButton("Hủy", on_click=close_dialog),
+                ft.FilledButton("Bắt đầu trim", icon=ft.Icons.CONTENT_CUT,
+                                on_click=start_batch_trim),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        ))
+
+    def show_project_run_sequence(_: ft.ControlEvent) -> None:
+        project_id = selected_project_id
+        if project_id is None or selected_chapter_id is not None:
+            return
+        chapters = project_chapters.get(project_id, [])
+        if not chapters:
+            project_feedback.value = "Project chưa có chapter để chạy."
+            project_feedback.color = ft.Colors.AMBER_300
+            page.update()
+            return
+
+        download_config = {"chapter": "all", "amount": "10"}
+        trim_config = {
+            "chapter": "all", "minimum": "5,0", "maximum": "6,0",
+            "start": "2,0", "workers": "4",
+        }
+        download_enabled = ft.Checkbox(label="Tải hàng loạt", value=True)
+        trim_enabled = ft.Checkbox(label="Trim hàng loạt", value=True)
+        download_summary = ft.Text("All · 10 video/keyword", size=12,
+                                   color=ft.Colors.BLUE_GREY_300, expand=True)
+        trim_summary = ft.Text("All · 5,0–6,0s · 4 luồng", size=12,
+                               color=ft.Colors.BLUE_GREY_300, expand=True)
+        message = ft.Text(size=12, color=ft.Colors.RED_300)
+        sequence_dialog: ft.AlertDialog
+
+        def chapter_label(value: str) -> str:
+            if value == "all":
+                return "All"
+            return next((row["title"] for row in chapters
+                         if str(row["id"]) == value), "Chapter")
+
+        def show_sequence_dialog() -> None:
+            page.show_dialog(sequence_dialog)
+
+        def setup_download(_: ft.ControlEvent) -> None:
+            chapter = ft.Dropdown(
+                label="Chapter", value=download_config["chapter"], width=360,
+                options=[ft.DropdownOption(key="all", text="All"), *[
+                    ft.DropdownOption(key=str(row["id"]), text=row["title"])
+                    for row in chapters]])
+            amount = ft.TextField(
+                label="Số lượng video trên mỗi keyword",
+                value=download_config["amount"], width=360,
+                input_filter=ft.InputFilter(allow=True, regex_string=r"[0-9]"))
+            setup_message = ft.Text(size=12, color=ft.Colors.RED_300)
+
+            def cancel(_: ft.ControlEvent) -> None:
+                page.pop_dialog()
+                show_sequence_dialog()
+
+            def save(_: ft.ControlEvent) -> None:
+                try:
+                    value = int(amount.value or "0")
+                    if not 1 <= value <= 200:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    setup_message.value = "Số lượng video phải từ 1 đến 200."
+                    page.update()
+                    return
+                download_config.update(chapter=str(chapter.value), amount=str(value))
+                download_summary.value = (
+                    f"{chapter_label(str(chapter.value))} · {value} video/keyword")
+                page.pop_dialog()
+                show_sequence_dialog()
+
+            page.pop_dialog()
+            page.show_dialog(ft.AlertDialog(
+                modal=True, title=ft.Text("Setup · Tải hàng loạt"),
+                content=ft.Column(tight=True, spacing=12,
+                                  controls=[chapter, amount, setup_message]),
+                actions=[ft.TextButton("Hủy", on_click=cancel),
+                         ft.FilledButton("Lưu setup", on_click=save)]))
+
+        def setup_trim(_: ft.ControlEvent) -> None:
+            chapter = ft.Dropdown(
+                label="Chapter", value=trim_config["chapter"], width=360,
+                options=[ft.DropdownOption(key="all", text="All"), *[
+                    ft.DropdownOption(key=str(row["id"]), text=row["title"])
+                    for row in chapters]])
+            minimum = ft.TextField(label="Min duration (s)", value=trim_config["minimum"],
+                                   width=175, keyboard_type=ft.KeyboardType.NUMBER)
+            maximum = ft.TextField(label="Max duration (s)", value=trim_config["maximum"],
+                                   width=175, keyboard_type=ft.KeyboardType.NUMBER)
+            start = ft.TextField(label="Bắt đầu từ (s)", value=trim_config["start"],
+                                 width=175, keyboard_type=ft.KeyboardType.NUMBER)
+            workers = ft.Dropdown(
+                label="Số luồng trim", value=trim_config["workers"], width=175,
+                options=[ft.DropdownOption(key=str(value), text=str(value))
+                         for value in range(1, 11)])
+            setup_message = ft.Text(size=12, color=ft.Colors.RED_300)
+
+            def cancel(_: ft.ControlEvent) -> None:
+                page.pop_dialog()
+                show_sequence_dialog()
+
+            def save(_: ft.ControlEvent) -> None:
+                try:
+                    low = round(float((minimum.value or "").replace(",", ".")), 1)
+                    high = round(float((maximum.value or "").replace(",", ".")), 1)
+                    start_value = round(float((start.value or "").replace(",", ".")), 3)
+                    worker_value = max(1, min(10, int(workers.value or "1")))
+                    if low <= 0 or high < low or start_value < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    setup_message.value = "Thông số duration hoặc số luồng không hợp lệ."
+                    page.update()
+                    return
+                trim_config.update(
+                    chapter=str(chapter.value), minimum=str(low), maximum=str(high),
+                    start=str(start_value), workers=str(worker_value))
+                trim_summary.value = (
+                    f"{chapter_label(str(chapter.value))} · {low:.1f}–{high:.1f}s · "
+                    f"{worker_value} luồng")
+                page.pop_dialog()
+                show_sequence_dialog()
+
+            page.pop_dialog()
+            page.show_dialog(ft.AlertDialog(
+                modal=True, title=ft.Text("Setup · Trim hàng loạt"),
+                content=ft.Container(width=370, content=ft.Column(
+                    tight=True, spacing=12, controls=[
+                        chapter, ft.Row([minimum, maximum]), ft.Row([start, workers]),
+                        setup_message])),
+                actions=[ft.TextButton("Hủy", on_click=cancel),
+                         ft.FilledButton("Lưu setup", on_click=save)]))
+
+        async def run_sequence(_: ft.ControlEvent) -> None:
+            nonlocal chapter_cancel_event, project_batch_project_id
+            if not download_enabled.value and not trim_enabled.value:
+                message.value = "Hãy chọn ít nhất một action."
+                page.update()
+                return
+            page.pop_dialog()
+            project_batch_download.disabled = True
+            project_batch_trim.disabled = True
+            project_run_sequence.disabled = True
+            action_total = int(bool(download_enabled.value)) + int(bool(trim_enabled.value))
+            action_index = 0
+            project_batch_project_id = project_id
+            project_batch_panel.visible = True
+            project_batch_log.controls.clear()
+            project_batch_log.visible = True
+            project_batch_log_toggle.icon = ft.Icons.EXPAND_LESS
+            project_batch_log_toggle.tooltip = "Thu gọn nhật ký"
+            project_batch_progress.value = 0
+            project_batch_count.value = f"0/{action_total} action"
+            project_batch_status.value = f"Chuẩn bị chạy tuần tự {action_total} action..."
+            project_batch_status.color = ft.Colors.BLUE_200
+            page.update()
+            try:
+                if download_enabled.value:
+                    action_index += 1
+                    targets = (chapters if download_config["chapter"] == "all" else [
+                        row for row in chapters
+                        if str(row["id"]) == download_config["chapter"]])
+                    project_feedback.value = (
+                        f"Chạy tuần tự {action_index}/{action_total}: Tải hàng loạt...")
+                    project_feedback.color = ft.Colors.BLUE_200
+                    page.update()
+                    project_batch_log.controls.append(ft.Text(
+                        f"▶ Action {action_index}/{action_total}: Tải hàng loạt "
+                        f"({len(targets)} chapter).", size=12, color=ft.Colors.BLUE_200))
+                    for chapter_position, chapter in enumerate(targets, start=1):
+                        project_batch_status.value = (
+                            f"Tải hàng loạt · chapter {chapter_position}/{len(targets)}: "
+                            f"{chapter['title']}")
+                        project_batch_count.value = f"{action_index}/{action_total} action"
+                        project_batch_progress.value = (
+                            (action_index - 1 + (chapter_position - 1) / len(targets))
+                            / action_total)
+                        keyword_text = str(chapter_keyword_state(chapter)["keyword"]).strip()
+                        if not keyword_text:
+                            project_batch_log.controls.append(ft.Text(
+                                f"⊘ {chapter['title']}: bỏ qua vì chưa có keyword.",
+                                size=12, color=ft.Colors.AMBER_300))
+                            page.update()
+                            continue
+                        project_batch_log.controls.append(ft.Text(
+                            f"  ▶ {chapter['title']}: bắt đầu tải.",
+                            size=12, color=ft.Colors.BLUE_200))
+                        chapter_cancel_event = None
+                        result = await begin_chapter_download(
+                            None, batch_run=True, target_project_id=project_id,
+                            target_chapter_id=chapter["id"], target_keyword=keyword_text,
+                            target_amount=int(download_config["amount"]))
+                        saved = int(result["saved"]) if result else 0
+                        has_errors = bool(result and result.get("has_errors"))
+                        project_batch_log.controls.append(ft.Text(
+                            f"  {'⚠' if has_errors or not saved else '✓'} "
+                            f"{chapter['title']}: "
+                            f"{result['message'] if result else 'Không nhận được kết quả tải.'}",
+                            size=12, color=(ft.Colors.AMBER_300 if has_errors or not saved
+                                           else ft.Colors.GREEN_300)))
+                        if result:
+                            for failure in result.get("keyword_failures", []):
+                                project_batch_log.controls.append(ft.Text(
+                                    f"     ⚠ Keyword {failure['keyword_index']} "
+                                    f"({failure['keyword']}): {failure['error_type']} — "
+                                    f"{failure['message']}",
+                                    size=11, color=ft.Colors.AMBER_300))
+                        project_batch_progress.value = (
+                            (action_index - 1 + chapter_position / len(targets))
+                            / action_total)
+                        page.update()
+                        if chapter_cancel_event is not None and chapter_cancel_event.is_set():
+                            break
+                    project_batch_log.controls.append(ft.Text(
+                        "✓ Hoàn tất action Tải hàng loạt.", size=12,
+                        color=ft.Colors.GREEN_300))
+
+                if trim_enabled.value and not (
+                        chapter_cancel_event is not None and chapter_cancel_event.is_set()):
+                    action_index += 1
+                    targets = (chapters if trim_config["chapter"] == "all" else [
+                        row for row in chapters if str(row["id"]) == trim_config["chapter"]])
+                    low = float(trim_config["minimum"].replace(",", "."))
+                    high = float(trim_config["maximum"].replace(",", "."))
+                    start_value = float(trim_config["start"].replace(",", "."))
+                    requested_workers = int(trim_config["workers"])
+                    all_records = await asyncio.to_thread(
+                        database.list_project_videos, project_id)
+                    total_completed = total_failed = 0
+                    project_batch_log.controls.append(ft.Text(
+                        f"▶ Action {action_index}/{action_total}: Trim hàng loạt "
+                        f"({len(targets)} chapter).", size=12, color=ft.Colors.BLUE_200))
+                    for chapter_position, chapter in enumerate(targets, start=1):
+                        chapter_id = chapter["id"]
+                        records = {row["id"]: row for row in all_records
+                                   if row["chapter_id"] == chapter_id}
+                        if not records:
+                            project_batch_log.controls.append(ft.Text(
+                                f"⊘ {chapter['title']}: không có video, bỏ qua.",
+                                size=12, color=ft.Colors.AMBER_300))
+                            project_batch_progress.value = (
+                                (action_index - 1 + chapter_position / len(targets))
+                                / action_total)
+                            page.update()
+                            continue
+                        project_batch_log.controls.append(ft.Text(
+                            f"  ▶ {chapter['title']}: bắt đầu trim {len(records)} video.",
+                            size=12, color=ft.Colors.BLUE_200))
+                        await asyncio.to_thread(
+                            database.add_edit_videos, list(records), project_id, chapter_id)
+                        semaphore = asyncio.Semaphore(min(len(records), requested_workers))
+
+                        async def trim_record(record_id: int) -> bool:
+                            record = records[record_id]
+                            destination = (ROOT / "edits" / str(project_id) / str(chapter_id)
+                                           / f"{record_id}_trimmed.mp4")
+                            try:
+                                async with semaphore:
+                                    output, trim_start, duration = await asyncio.to_thread(
+                                        trim_random_video, Path(record["file_path"]), destination,
+                                        low, high, start_at=start_value)
+                                    poster = await asyncio.to_thread(thumbnail_bytes, output)
+                                    trim_thumbnail_cache[str(output)] = (
+                                        media_file_fingerprint(output), poster)
+                                    order_thumbnail_cache.pop(str(output), None)
+                                    await asyncio.to_thread(
+                                        database.save_edit_trim, record_id, project_id,
+                                        chapter_id, output, trim_start, duration)
+                                return True
+                            except Exception as exc:
+                                try:
+                                    await asyncio.to_thread(
+                                        database.save_edit_trim_error, record_id, project_id,
+                                        chapter_id, str(exc))
+                                except sqlite3.Error:
+                                    pass
+                                return False
+
+                        tasks = [asyncio.create_task(trim_record(record_id))
+                                 for record_id in records]
+                        chapter_failed = 0
+                        for video_position, task in enumerate(
+                                asyncio.as_completed(tasks), start=1):
+                            if await task:
+                                total_completed += 1
+                            else:
+                                total_failed += 1
+                                chapter_failed += 1
+                            project_feedback.value = (
+                                f"Chạy tuần tự {action_index}/{action_total}: Trim · "
+                                f"chapter {chapter_position}/{len(targets)} · "
+                                f"{video_position}/{len(records)} video...")
+                            project_feedback.color = ft.Colors.BLUE_200
+                            project_batch_status.value = (
+                                f"Trim hàng loạt · chapter {chapter_position}/{len(targets)}: "
+                                f"{chapter['title']} · {video_position}/{len(records)} video")
+                            project_batch_count.value = f"{action_index}/{action_total} action"
+                            chapter_fraction = ((chapter_position - 1)
+                                                + video_position / len(records)) / len(targets)
+                            project_batch_progress.value = (
+                                (action_index - 1 + chapter_fraction) / action_total)
+                            page.update()
+                        invalidate_edit_scope(project_id, chapter_id)
+                        project_batch_log.controls.append(ft.Text(
+                            f"  {'✓' if not chapter_failed else '⚠'} {chapter['title']}: "
+                            f"đã xử lý {len(records)} video.", size=12,
+                            color=(ft.Colors.GREEN_300 if not chapter_failed
+                                   else ft.Colors.AMBER_300)))
+                    project_feedback.value = (
+                        f"Chạy tuần tự hoàn tất: trim {total_completed} thành công, "
+                        f"{total_failed} lỗi.")
+                    project_feedback.color = (ft.Colors.GREEN_300 if not total_failed
+                                              else ft.Colors.AMBER_300)
+                    project_batch_log.controls.append(ft.Text(
+                        f"{'✓' if not total_failed else '⚠'} Hoàn tất action Trim hàng loạt: "
+                        f"{total_completed} thành công, {total_failed} lỗi.",
+                        size=12, color=(ft.Colors.GREEN_300 if not total_failed
+                                       else ft.Colors.AMBER_300)))
+                elif download_enabled.value:
+                    project_feedback.value = "Chạy tuần tự hoàn tất: Tải hàng loạt."
+                    project_feedback.color = ft.Colors.GREEN_300
+                project_entry_cache.pop(project_id, None)
+                await select_project(project_id, None, force_reload=True)
+                project_batch_progress.value = 1
+                project_batch_count.value = f"{action_total}/{action_total} action"
+                project_batch_status.value = "Chạy tuần tự hoàn tất."
+                project_batch_status.color = project_feedback.color
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                project_feedback.value = f"Chạy tuần tự bị lỗi: {exc}"
+                project_feedback.color = ft.Colors.RED_300
+                project_batch_status.value = project_feedback.value
+                project_batch_status.color = ft.Colors.RED_300
+                project_batch_log.controls.append(ft.Text(
+                    f"✕ {project_feedback.value}", size=12, color=ft.Colors.RED_300))
+            finally:
+                project_batch_download.disabled = False
+                project_batch_trim.disabled = False
+                project_run_sequence.disabled = False
+                page.update()
+
+        sequence_dialog = ft.AlertDialog(
+            modal=True, title=ft.Text("Chạy tuần tự"),
+            content=ft.Container(width=540, content=ft.Column(
+                tight=True, spacing=8, controls=[
+                    ft.Container(padding=10, border_radius=8, bgcolor="#131c33",
+                                 content=ft.Row([
+                                     download_enabled, download_summary,
+                                     ft.OutlinedButton("Setup", icon=ft.Icons.SETTINGS,
+                                                       on_click=setup_download)])),
+                    ft.Container(padding=10, border_radius=8, bgcolor="#131c33",
+                                 content=ft.Row([
+                                     trim_enabled, trim_summary,
+                                     ft.OutlinedButton("Setup", icon=ft.Icons.SETTINGS,
+                                                       on_click=setup_trim)])),
+                    ft.Text("Các action được chạy lần lượt từ trên xuống.", size=12,
+                            color=ft.Colors.BLUE_GREY_300),
+                    message,
+                ])),
+            actions=[
+                ft.TextButton("Hủy", on_click=lambda _: page.pop_dialog()),
+                ft.FilledButton("Bắt đầu chạy", icon=ft.Icons.PLAYLIST_PLAY,
+                                on_click=run_sequence),
+            ], actions_alignment=ft.MainAxisAlignment.END)
+        show_sequence_dialog()
+
     project_name.on_submit = on_create_project
     project_create.on_click = on_create_project
     chapter_name.on_submit = on_create_chapter
     chapter_create.on_click = on_create_chapter
+    chapter_keyword.on_change = remember_chapter_keyword
+    chapter_keyword.on_submit = begin_chapter_download
+    chapter_download.on_click = begin_chapter_download
+    chapter_cancel.on_click = cancel_chapter_download
+    chapter_keyword_edit.on_click = toggle_chapter_keyword_edit
+    project_batch_download.on_click = show_project_batch_download
+    project_batch_trim.on_click = show_project_batch_trim
+    project_run_sequence.on_click = show_project_run_sequence
+    project_batch_log_toggle.on_click = toggle_project_batch_log
     project_sidebar = ft.Container(
         width=260, bgcolor="#10182c", padding=ft.Padding.all(12),
         content=ft.Column(expand=True, spacing=12, controls=[
@@ -2669,7 +4026,7 @@ async def main(page: ft.Page) -> None:
     chapter_tabs = ft.Tabs(
         length=3,
         expand=True,
-        content=ft.Column(expand=True, spacing=12, controls=[
+        content=ft.Column(expand=True, spacing=2, controls=[
             ft.TabBar(
                 tabs=[ft.Tab(label="Video stock"), ft.Tab(label="Trim Video"),
                       ft.Tab(label="Order Video")],
@@ -2678,9 +4035,10 @@ async def main(page: ft.Page) -> None:
                 label_color=ft.Colors.CYAN_200,
                 unselected_label_color=ft.Colors.BLUE_GREY_300,
                 divider_color="#263250",
+                height=40,
             ),
             ft.TabBarView(expand=True, controls=[
-                ft.Column(expand=True, spacing=12, controls=[
+                ft.Column(expand=True, spacing=4, controls=[
                     ft.Row([project_select_all, project_selected_count, project_delete,
                             project_save, project_move, edit_add_stock], spacing=4),
                     project_action_status, project_empty, project_grid,
@@ -2718,14 +4076,41 @@ async def main(page: ft.Page) -> None:
             ]),
         ]),
     )
+
+    async def on_chapter_tab_change(_: ft.ControlEvent) -> None:
+        """Load and render only the tab the user has opened."""
+        if selected_project_id is None or selected_chapter_id is None:
+            return
+        active_tab = int(chapter_tabs.selected_index or 0)
+        if active_tab == 0:
+            render_project_grid()
+        else:
+            try:
+                await reload_edit_scope(selected_project_id, selected_chapter_id)
+            except sqlite3.Error:
+                edit_status.value = "Không thể nạp danh sách video Edit."
+                edit_status.color = ft.Colors.RED_300
+                page.update()
+                return
+            if active_tab == 1:
+                render_edit_grid()
+            else:
+                render_order_layout()
+        page.update()
+
+    chapter_tabs.on_change = on_chapter_tab_change
     project_view = ft.Row(expand=True, spacing=0, controls=[
         project_sidebar,
         ft.Container(width=1, bgcolor="#263250"),
-        ft.Container(expand=True, padding=ft.Padding.all(20), content=ft.Column(
-            expand=True, spacing=12, controls=[
+        ft.Container(expand=True,
+                     padding=ft.Padding.symmetric(horizontal=20, vertical=10),
+                     content=ft.Column(
+            expand=True, spacing=6, controls=[
                 chapter_title, chapter_count,
-                ft.Row([chapter_name, chapter_create], vertical_alignment=ft.CrossAxisAlignment.END),
-                chapter_feedback, ft.Divider(color="#263250"),
+                chapter_create_row, chapter_feedback, chapter_download_preview,
+                project_chapter_keywords,
+                project_batch_panel,
+                ft.Divider(height=1, thickness=1, color="#263250"),
                 chapter_tabs,
             ],
         )),
@@ -2850,6 +4235,7 @@ async def main(page: ft.Page) -> None:
                     for row in records if row["id"] in removed_ids)
                 project_loaded = False
                 project_entry_cache.clear()
+                invalidate_all_edit_scopes()
                 remove_library_results(removed_ids)
                 if current_view == "project" and selected_project_id is not None:
                     await select_project(selected_project_id, selected_chapter_id, force_reload=True)
@@ -2890,8 +4276,10 @@ async def main(page: ft.Page) -> None:
             asyncio.to_thread(database.list_projects),
             asyncio.to_thread(database.list_all_chapters),
         )
+        project_ids_with_chapters = {row["project_id"] for row in chapters}
+        projects = [row for row in projects if row["id"] in project_ids_with_chapters]
         if not projects:
-            action_message(section, "Chưa có project. Hãy tạo project trong mục Project trước.", error=True)
+            action_message(section, "Chưa có chapter. Hãy tạo chapter trong mục Project trước.", error=True)
             return
         project_names = {row["id"]: row["name"] for row in projects}
         chapter_names = {row["id"]: row["title"] for row in chapters}
@@ -2902,12 +4290,12 @@ async def main(page: ft.Page) -> None:
                      for row in projects])
 
         def chapter_options(project_id: int) -> list[ft.DropdownOption]:
-            return [ft.DropdownOption(key="root", text="In project"),
-                    *[ft.DropdownOption(key=str(row["id"]), text=row["title"])
-                      for row in chapters if row["project_id"] == project_id]]
+            return [ft.DropdownOption(key=str(row["id"]), text=row["title"])
+                    for row in chapters if row["project_id"] == project_id]
 
-        chapter_choice = ft.Dropdown(label="Chapter", value="root",
-                                     options=chapter_options(first_id), expand=True)
+        initial_chapter_options = chapter_options(first_id)
+        chapter_choice = ft.Dropdown(label="Chapter", value=initial_chapter_options[0].key,
+                                     options=initial_chapter_options, expand=True)
         destinations: list[tuple[int, int | None]] = []
         selected_label = ft.Text("Vị trí đã thêm", size=12,
                                  color=ft.Colors.BLUE_GREY_300, visible=False)
@@ -2917,8 +4305,7 @@ async def main(page: ft.Page) -> None:
 
         def current_destination() -> tuple[int, int | None]:
             project_id = int(project_choice.value)
-            chapter_id = None if chapter_choice.value == "root" else int(chapter_choice.value)
-            return project_id, chapter_id
+            return project_id, int(chapter_choice.value)
 
         def render_destinations() -> None:
             selected_label.visible = bool(destinations)
@@ -2927,8 +4314,7 @@ async def main(page: ft.Page) -> None:
             selected_list.controls.clear()
             for destination in destinations:
                 project_id, chapter_id = destination
-                label = (f"{project_names[project_id]} / " +
-                         (chapter_names[chapter_id] if chapter_id is not None else "In project"))
+                label = f"{project_names[project_id]} / {chapter_names[chapter_id]}"
 
                 def remove(_: ft.ControlEvent, target: tuple[int, int | None] = destination) -> None:
                     destinations.remove(target)
@@ -2947,7 +4333,7 @@ async def main(page: ft.Page) -> None:
             except (TypeError, ValueError):
                 return
             chapter_choice.options = chapter_options(project_id)
-            chapter_choice.value = "root"
+            chapter_choice.value = chapter_choice.options[0].key
             page.update()
 
         project_choice.on_select = change_project

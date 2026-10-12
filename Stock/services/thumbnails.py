@@ -36,31 +36,39 @@ def _frame(source: Path, target: Path, ffmpeg: str, video: bool, width: int) -> 
 
 
 def ensure_thumbnail(video_path: Path) -> Path | None:
-    """Use a saved poster or extract a frame; preserve any pre-existing JPG."""
+    """Use only sidecars newer than the video; refresh stale trim thumbnails."""
     if not video_path.is_file():
         return None
     poster = video_path.with_suffix(".jpg")
     thumb = video_path.with_suffix(".thumb.jpg")
     poster_valid = is_jpeg(poster)
+    video_mtime = 0
+    try:
+        video_mtime = video_path.stat().st_mtime_ns
+        poster_fresh = poster_valid and poster.stat().st_mtime_ns >= video_mtime
+    except OSError:
+        poster_fresh = False
     if is_jpeg(thumb):
         try:
-            if thumb.stat().st_mtime >= max(video_path.stat().st_mtime,
-                                            poster.stat().st_mtime if poster_valid else 0):
+            if thumb.stat().st_mtime_ns >= max(
+                    video_mtime,
+                    poster.stat().st_mtime_ns if poster_fresh else 0):
                 return thumb
         except OSError:
             pass
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        return poster if poster_valid else None
-    if not poster_valid and not poster.exists():
+        return poster if poster_fresh else None
+    if not poster_fresh:
         poster_valid = (_frame(video_path, poster, ffmpeg, video=True, width=1280)
                         or _frame(video_path, poster, ffmpeg, video=False, width=1280))
-    if poster_valid and _frame(poster, thumb, ffmpeg, video=False, width=480):
+        poster_fresh = poster_valid
+    if poster_fresh and _frame(poster, thumb, ffmpeg, video=False, width=480):
         return thumb
     if (_frame(video_path, thumb, ffmpeg, video=True, width=480)
             or _frame(video_path, thumb, ffmpeg, video=False, width=480)):
         return thumb
-    return poster if poster_valid else None
+    return poster if poster_fresh else None
 
 
 def thumbnail_bytes(video_path: Path) -> bytes | None:

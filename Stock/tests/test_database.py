@@ -409,11 +409,20 @@ class DatabaseTests(unittest.TestCase):
         class Page:
             window = SimpleNamespace()
 
+            def __init__(self):
+                self.dialog = None
+
             def add(self, *controls):
                 self.controls = controls
 
             def update(self):
                 pass
+
+            def show_dialog(self, dialog):
+                self.dialog = dialog
+
+            def pop_dialog(self):
+                self.dialog = None
 
         page = Page()
         with patch.object(main, 'VideoDatabase', return_value=self.db), \
@@ -429,7 +438,7 @@ class DatabaseTests(unittest.TestCase):
             asyncio.run(create_project.on_click(None))
             self.assertEqual(len(self.db.list_projects()), 1)
             detail = project_view.controls[2].content.controls
-            chapter_name, add_chapter = detail[2].controls
+            chapter_name, add_chapter = detail[2].controls[0].controls
             self.assertFalse(add_chapter.disabled)
             for title in ('Opening', 'Main story'):
                 chapter_name.value = title
@@ -438,6 +447,282 @@ class DatabaseTests(unittest.TestCase):
                              ['Opening', 'Main story'])
             self.assertEqual(detail[0].value, 'Main story')
             self.assertEqual(detail[1].value, '0 video trong chapter')
+            self.assertFalse(detail[2].visible)
+            chapter_download_preview = detail[4]
+            self.assertTrue(chapter_download_preview.visible)
+            settings, keyword_row, status, progress = chapter_download_preview.controls
+            self.assertEqual(settings.controls[0].value, 'Thiết lập tải video')
+            self.assertEqual(keyword_row.controls[0].label, 'Keyword')
+            self.assertEqual(keyword_row.controls[1].label, 'Số video')
+            self.assertFalse(keyword_row.controls[2].disabled)
+            self.assertTrue(keyword_row.controls[3].disabled)
+            keyword_field = keyword_row.controls[0]
+            edit_keyword = keyword_row.controls[4]
+            keyword_field.value = 'Alaska'
+            asyncio.run(keyword_field.on_change(None))
+            asyncio.run(edit_keyword.on_click(None))
+            self.assertTrue(keyword_field.disabled)
+            self.assertIsNone(keyword_field.text_style)
+            self.assertEqual(self.db.list_chapters(self.db.list_projects()[0]['id'])[-1]['keyword'],
+                             'Alaska')
+            self.assertEqual(self.db.list_chapters(self.db.list_projects()[0]['id'])[-1]['keyword_locked'],
+                             1)
+            asyncio.run(edit_keyword.on_click(None))
+            self.assertFalse(keyword_field.disabled)
+            self.assertIsNone(keyword_field.text_style)
+            self.assertIn('Library', status.value)
+            self.assertFalse(progress.controls[0].visible)
+            project_list = side_controls[-1]
+            asyncio.run(project_list.controls[0].controls[0].content.controls[1].on_click(None))
+            batch_button, batch_trim, run_sequence = detail[2].controls[1].controls
+            self.assertTrue(batch_button.visible)
+            self.assertFalse(batch_button.disabled)
+            self.assertEqual(batch_trim.content, 'Trim hàng loạt')
+            self.assertTrue(batch_trim.disabled)
+            self.assertEqual(run_sequence.content, 'Chạy tuần tự')
+            self.assertTrue(run_sequence.disabled)
+            batch_button.on_click(None)
+            self.assertEqual(page.dialog.title.value, 'Tải video hàng loạt')
+            chapter_choice, amount, feedback = page.dialog.content.controls
+            self.assertEqual([option.key for option in chapter_choice.options],
+                             ['all', str(self.db.list_chapters(self.db.list_projects()[0]['id'])[0]['id']),
+                              str(self.db.list_chapters(self.db.list_projects()[0]['id'])[1]['id'])])
+            self.assertEqual(chapter_choice.value, 'all')
+            self.assertEqual(amount.value, '10')
+            self.assertEqual(feedback.value, '')
+
+    def test_chapter_download_saves_to_library_assigns_chapter_and_skips_duplicates(self):
+        class Page:
+            window = SimpleNamespace()
+
+            def add(self, *controls):
+                self.controls = controls
+
+            def update(self, *controls):
+                pass
+
+        page = Page()
+        selected = video(901)
+        download_worker_counts = []
+
+        def fake_select(api_pool, keyword, amount, root, database, owner, cancel, **options):
+            target = root / keyword / '901_1280x720.mp4'
+            return [selected] if database.reserve(selected, keyword, target, owner) else []
+
+        def fake_download(videos, root, keyword, cancel, report, database, owner, **options):
+            download_worker_counts.append(options.get('workers'))
+            destination = root / keyword
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / '901_1280x720.mp4').write_bytes(b'video')
+            database.record(901, owner, 'completed')
+            report(main.DownloadEvent(901, 'done', 1, 'done'))
+            return destination
+
+        with patch.object(main, 'VideoDatabase', return_value=self.db), \
+             patch.object(main, 'ROOT', self.root), patch.object(main, 'LIBRARY_ROOT', self.library), \
+             patch.object(main, 'select_unique', side_effect=fake_select), \
+             patch.object(main, 'download_many', side_effect=fake_download):
+            asyncio.run(main.main(page))
+            sidebar = page.controls[0].controls[0].content.controls
+            asyncio.run(sidebar[4].on_click(None))
+            project_view = page.controls[0].controls[2].content.controls[3].content
+            project_name, create_project = project_view.controls[0].content.controls[1:3]
+            project_name.value = 'Project'
+            asyncio.run(create_project.on_click(None))
+            detail = project_view.controls[2].content.controls
+            chapter_name, add_chapter = detail[2].controls[0].controls
+            chapter_name.value = 'Opening'
+            asyncio.run(add_chapter.on_click(None))
+
+            settings, keyword_row, status, _ = detail[4].controls
+            settings.method_dropdown.value = 'api'
+            settings.source_dropdown.value = 'pixabay'
+            settings.workers_dropdown.value = '10'
+            keyword_row.controls[0].value = 'Moscow'
+            keyword_row.controls[1].value = '1'
+            asyncio.run(keyword_row.controls[2].on_click(None))
+
+            records = self.db.library()
+            self.assertEqual(len(records), 1)
+            project_id = self.db.list_projects()[0]['id']
+            chapter_id = self.db.list_chapters(project_id)[0]['id']
+            self.assertEqual([row['id'] for row in self.db.list_project_videos(project_id)],
+                             [records[0]['id']])
+            self.assertEqual(self.db.list_project_videos(project_id)[0]['chapter_id'], chapter_id)
+            self.assertEqual(download_worker_counts, [1])
+            self.assertIn('Hoàn tất: 1 video mới', status.value)
+
+            asyncio.run(keyword_row.controls[2].on_click(None))
+            self.assertEqual(len(self.db.library()), 1)
+            self.assertEqual(len(self.db.list_project_videos(project_id)), 1)
+            self.assertIn('video trùng Library', status.value)
+
+    def test_project_batch_download_all_processes_chapters_in_order(self):
+        class Page:
+            window = SimpleNamespace()
+
+            def __init__(self):
+                self.dialog = None
+
+            def add(self, *controls):
+                self.controls = controls
+
+            def update(self, *controls):
+                pass
+
+            def show_dialog(self, dialog):
+                self.dialog = dialog
+
+            def pop_dialog(self):
+                self.dialog = None
+
+        project_id = self.db.create_project('Batch project')
+        first = self.db.create_chapter(project_id, 'First')
+        second = self.db.create_chapter(project_id, 'Second')
+        self.db.update_chapter_keyword(project_id, first, 'Alpha', False)
+        self.db.update_chapter_keyword(project_id, second, 'Beta, Broken', False)
+        ids = {'Alpha': 951, 'Beta': 952}
+        download_order = []
+        action_trace = []
+
+        def fake_select(api_pool, keyword, amount, root, database, owner, cancel, **options):
+            action_trace.append(f'download:{keyword}')
+            if keyword == 'Alpha':
+                return []
+            if keyword == 'Broken':
+                raise RuntimeError('simulated keyword failure')
+            selected = video(ids[keyword])
+            target = root / keyword / f'{selected.id}_1280x720.mp4'
+            return [selected] if database.reserve(selected, keyword, target, owner) else []
+
+        def fake_download(videos, root, keyword, cancel, report, database, owner, **options):
+            download_order.append(keyword)
+            destination = root / keyword
+            destination.mkdir(parents=True, exist_ok=True)
+            for selected in videos:
+                (destination / f'{selected.id}_1280x720.mp4').write_bytes(b'video')
+                database.record(selected.id, owner, 'completed')
+                report(main.DownloadEvent(selected.id, 'done', 1, 'done'))
+            return destination
+
+        page = Page()
+        with patch.object(main, 'VideoDatabase', return_value=self.db), \
+             patch.object(main, 'ROOT', self.root), patch.object(main, 'LIBRARY_ROOT', self.library), \
+             patch.object(main, 'select_unique', side_effect=fake_select), \
+             patch.object(main, 'download_many', side_effect=fake_download):
+            asyncio.run(main.main(page))
+            sidebar = page.controls[0].controls[0].content.controls
+            asyncio.run(sidebar[4].on_click(None))
+            project_view = page.controls[0].controls[2].content.controls[3].content
+            detail = project_view.controls[2].content.controls
+            settings = detail[4].controls[0]
+            settings.method_dropdown.value = 'api'
+            settings.source_dropdown.value = 'pixabay'
+            batch_button = detail[2].controls[1].controls[0]
+            batch_button.on_click(None)
+            amount = page.dialog.content.controls[1]
+            amount.value = '1'
+            asyncio.run(page.dialog.actions[1].on_click(None))
+
+            batch_panel = detail[6]
+            self.assertTrue(batch_panel.visible)
+            batch_header, batch_progress, batch_log = batch_panel.content.controls
+            batch_status, batch_count, log_toggle = batch_header.controls
+            self.assertEqual(
+                batch_status.value,
+                'Hoàn tất: 1 chapter có video, 1 không có video/lỗi, '
+                '1 chapter có keyword lỗi.')
+            self.assertEqual(batch_status.color, main.ft.Colors.AMBER_300)
+            self.assertEqual(batch_progress.value, 1)
+            self.assertEqual(batch_count.value, '2/2 chapter')
+            self.assertEqual(len(batch_log.controls), 5)
+            self.assertIn('First: bắt đầu 1 keyword', batch_log.controls[0].value)
+            self.assertTrue(batch_log.controls[1].value.startswith('⚠ First:'))
+            self.assertIn('Second: bắt đầu 2 keyword', batch_log.controls[2].value)
+            self.assertTrue(batch_log.controls[3].value.startswith('⚠ Second:'))
+            self.assertIn('1/2 keyword lỗi', batch_log.controls[3].value)
+            self.assertIn('Keyword 2 (Broken): RuntimeError', batch_log.controls[4].value)
+            log_toggle.on_click(None)
+            self.assertFalse(batch_log.visible)
+            self.assertEqual(log_toggle.tooltip, 'Mở rộng nhật ký')
+            log_toggle.on_click(None)
+            self.assertTrue(batch_log.visible)
+            self.assertEqual(log_toggle.tooltip, 'Thu gọn nhật ký')
+
+            batch_trim = detail[2].controls[1].controls[1]
+            self.assertFalse(batch_trim.disabled)
+            batch_trim.on_click(None)
+            self.assertEqual(page.dialog.title.value, 'Trim video hàng loạt')
+            trim_fields = page.dialog.content.content.controls
+            self.assertEqual(trim_fields[0].value, 'all')
+
+            def fake_trim(source, destination, minimum, maximum, *, start_at=None):
+                action_trace.append('trim')
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b'trimmed')
+                return destination, start_at, minimum
+
+            with patch.object(main, 'trim_random_video', side_effect=fake_trim):
+                asyncio.run(page.dialog.actions[1].on_click(None))
+
+            self.assertIn('Trim hàng loạt hoàn tất: 1 thành công, 0 lỗi, '
+                          '1 chapter trống.',
+                          project_view.controls[0].content.controls[3].value)
+            trim_rows = self.db.list_edit_videos(project_id, second)
+            self.assertEqual(len(trim_rows), 1)
+            self.assertEqual(trim_rows[0]['trim_status'], 'completed')
+
+            action_trace.clear()
+            run_sequence = detail[2].controls[1].controls[2]
+            self.assertFalse(run_sequence.disabled)
+            run_sequence.on_click(None)
+            self.assertEqual(page.dialog.title.value, 'Chạy tuần tự')
+            sequence_rows = page.dialog.content.content.controls
+            self.assertTrue(sequence_rows[0].content.controls[0].value)
+            self.assertTrue(sequence_rows[1].content.controls[0].value)
+            self.assertTrue(callable(sequence_rows[0].content.controls[-1].on_click))
+            self.assertTrue(callable(sequence_rows[1].content.controls[-1].on_click))
+
+            sequence_rows[0].content.controls[-1].on_click(None)
+            self.assertEqual(page.dialog.title.value, 'Setup · Tải hàng loạt')
+            download_setup = page.dialog.content.controls
+            download_setup[0].value = str(second)
+            download_setup[1].value = '1'
+            page.dialog.actions[1].on_click(None)
+
+            sequence_rows = page.dialog.content.content.controls
+            sequence_rows[1].content.controls[-1].on_click(None)
+            self.assertEqual(page.dialog.title.value, 'Setup · Trim hàng loạt')
+            trim_setup = page.dialog.content.content.controls
+            trim_setup[0].value = str(second)
+            page.dialog.actions[1].on_click(None)
+
+            with patch.object(main, 'trim_random_video', side_effect=fake_trim):
+                asyncio.run(page.dialog.actions[1].on_click(None))
+            self.assertEqual(action_trace[-1], 'trim')
+            self.assertTrue(any(item.startswith('download:') for item in action_trace[:-1]))
+            self.assertIn('Chạy tuần tự hoàn tất: trim 1 thành công, 0 lỗi.',
+                          project_view.controls[0].content.controls[3].value)
+            self.assertEqual(batch_status.value, 'Chạy tuần tự hoàn tất.')
+            self.assertEqual(batch_progress.value, 1)
+            self.assertEqual(batch_count.value, '2/2 action')
+            sequence_log = [control.value for control in batch_log.controls]
+            download_action = next(index for index, value in enumerate(sequence_log)
+                                   if 'Action 1/2: Tải hàng loạt' in value)
+            trim_action = next(index for index, value in enumerate(sequence_log)
+                               if 'Action 2/2: Trim hàng loạt' in value)
+            self.assertLess(download_action, trim_action)
+            self.assertTrue(any('Second: bắt đầu tải' in value for value in sequence_log))
+            self.assertTrue(any('Second: bắt đầu trim 1 video' in value
+                                for value in sequence_log))
+            log_toggle.on_click(None)
+            self.assertFalse(batch_log.visible)
+            log_toggle.on_click(None)
+            self.assertTrue(batch_log.visible)
+
+        self.assertEqual(download_order, ['Beta'])
+        self.assertEqual([row['chapter_id'] for row in self.db.list_project_videos(project_id)],
+                         [second])
 
     def test_project_sidebar_delete_icons_require_confirmation(self):
         class Page:
@@ -554,8 +839,11 @@ class DatabaseTests(unittest.TestCase):
             self.assertFalse(chapter_tabs.content.controls[0].tabs[2].disabled)
             stock_tab = chapter_tabs.content.controls[1].controls[0]
             project_grid = stock_tab.controls[-1]
-            self.assertEqual({card.data for card in project_grid.controls}, set(record_ids.values()))
-            self.assertEqual(len(project_grid.controls), 2)
+            self.assertEqual(project_grid.controls, [])
+            self.assertFalse(chapter_tabs.visible)
+            project_keyword_rows = detail[5]
+            self.assertTrue(project_keyword_rows.visible)
+            self.assertEqual(len(project_keyword_rows.controls), 2)
             project_item = project_list.controls[0]
             self.assertEqual(len(project_item.controls), 3)
             project_item.controls[0].content.controls[0].on_click(None)
@@ -565,15 +853,39 @@ class DatabaseTests(unittest.TestCase):
             asyncio.run(project_list.controls[0].controls[1].on_click(None))
             self.assertEqual(detail[0].value, 'Opening')
             self.assertEqual([card.data for card in project_grid.controls], [record_ids[101]])
+            self.assertTrue(chapter_tabs.visible)
             self.assertEqual(load.call_count, 1)
+            with patch.object(self.db, 'list_edit_videos',
+                              wraps=self.db.list_edit_videos) as edit_query, \
+                 patch.object(self.db, 'list_ordered_video_ids',
+                              wraps=self.db.list_ordered_video_ids) as order_query:
+                chapter_tabs.selected_index = 1
+                asyncio.run(chapter_tabs.on_change(None))
+                self.assertEqual((edit_query.call_count, order_query.call_count), (1, 1))
+                chapter_tabs.selected_index = 0
+                asyncio.run(chapter_tabs.on_change(None))
+                chapter_tabs.selected_index = 1
+                asyncio.run(chapter_tabs.on_change(None))
+                self.assertEqual((edit_query.call_count, order_query.call_count), (1, 1))
+            chapter_tabs.selected_index = 0
             asyncio.run(project_list.controls[0].controls[2].on_click(None))
-            self.assertEqual({card.data for card in project_grid.controls}, set(record_ids.values()))
+            self.assertEqual({card.data for card in project_grid.controls},
+                             {record_ids[101], record_ids[102]})
             self.assertEqual(load.call_count, 1)
             project_label = project_list.controls[0].controls[0].content.controls[1]
             asyncio.run(project_label.on_click(None))
-            self.assertEqual(len(project_grid.controls), 2)
-            project_grid.controls[0].on_click(None)
-            self.assertIsInstance(page.dialog, main.ft.AlertDialog)
+            self.assertEqual(project_grid.controls, [])
+            self.assertTrue(project_keyword_rows.visible)
+            opening_keyword = project_keyword_rows.controls[0].content.controls[1]
+            opening_edit = project_keyword_rows.controls[0].content.controls[2]
+            opening_keyword.value = 'Ice coast'
+            asyncio.run(opening_keyword.on_change(None))
+            asyncio.run(opening_edit.on_click(None))
+            self.assertTrue(opening_keyword.disabled)
+            asyncio.run(project_list.controls[0].controls[1].on_click(None))
+            chapter_keyword = detail[4].controls[1].controls[0]
+            self.assertEqual(chapter_keyword.value, 'Ice coast')
+            self.assertTrue(chapter_keyword.disabled)
 
     def test_project_chapter_bulk_icons_export_move_and_delete(self):
         class Page:
@@ -607,6 +919,7 @@ class DatabaseTests(unittest.TestCase):
         second = self.db.create_chapter(project_id, 'Places')
         records = {row['video_id']: row['id'] for row in self.db.library()}
         self.db.assign_videos([records[111]], project_id, first)
+        self.db.assign_videos([records[112]], project_id, first)
         self.db.assign_videos([records[112]], project_id, second)
         page = Page()
 
@@ -621,6 +934,8 @@ class DatabaseTests(unittest.TestCase):
             sidebar = page.controls[0].controls[0].content.controls
             project_view = page.controls[0].controls[2].content.controls[3].content
             asyncio.run(sidebar[4].on_click(None))
+            project_list = project_view.controls[0].content.controls[-1]
+            asyncio.run(project_list.controls[0].controls[1].on_click(None))
             detail = project_view.controls[2].content.controls
             stock_tab = detail[-1].content.controls[1].controls[0]
             select_all, count, delete, export, move, add_stock = stock_tab.controls[0].controls
@@ -695,11 +1010,11 @@ class DatabaseTests(unittest.TestCase):
             preview_stack = first_order_card.content.controls[1].content
             self.assertIsInstance(preview_stack.controls[0], main.ft.Image)
             self.assertTrue(callable(preview_stack.controls[1].content.on_click))
-            self.assertEqual(len(self.db.list_ordered_video_ids(project_id)), 2)
+            self.assertEqual(len(self.db.list_ordered_video_ids(project_id, first)), 2)
             self.assertEqual(len(pool.controls), 0)
             asyncio.run(pool_target.on_accept(
                 SimpleNamespace(src=ordered_list.controls[1])))
-            self.assertEqual(len(self.db.list_ordered_video_ids(project_id)), 1)
+            self.assertEqual(len(self.db.list_ordered_video_ids(project_id, first)), 1)
             self.assertEqual(len(pool_target.content.controls[1].controls), 1)
             edit_select_all.on_click(None)
             self.assertEqual(edit_count.value, '2 đã chọn')
@@ -713,10 +1028,13 @@ class DatabaseTests(unittest.TestCase):
             save_file.assert_awaited_once()
             with zipfile.ZipFile(archive) as contents:
                 self.assertEqual(set(contents.namelist()), {files[111].name, files[112].name})
-            project_list = project_view.controls[0].content.controls[-1]
-            asyncio.run(project_list.controls[0].controls[1].on_click(None))
+            select_all.on_click(None)
+            first_card = next(card for card in stock_tab.controls[-1].controls
+                              if card.data == records[111])
+            first_card.content.controls[0].content.controls[1].content.on_click(None)
             self.assertEqual(count.value, '1 đã chọn')
-            self.assertEqual([card.data for card in stock_tab.controls[-1].controls], [records[111]])
+            self.assertEqual({card.data for card in stock_tab.controls[-1].controls},
+                             set(records.values()))
             export_folder = self.root / 'export'
             export_folder.mkdir()
             with patch.object(page.services[0], 'get_directory_path',
@@ -819,17 +1137,18 @@ class DatabaseTests(unittest.TestCase):
             project_choice.on_select(None)
             chapter_choice.value = str(other_chapter)
             add_button.on_click(None)
-            self.assertEqual(len(fields[4].controls), 3)
-            fields[4].controls[1].controls[1].on_click(None)
+            self.assertNotIn('root', [option.key for option in chapter_choice.options])
             self.assertEqual(len(fields[4].controls), 2)
+            fields[4].controls[0].controls[1].on_click(None)
+            self.assertEqual(len(fields[4].controls), 1)
             project_choice.value = str(project_id)
             project_choice.on_select(None)
             chapter_choice.value = str(chapter_id)
             add_button.on_click(None)
-            self.assertEqual(len(fields[4].controls), 3)
+            self.assertEqual(len(fields[4].controls), 2)
             asyncio.run(page.dialog.actions[1].on_click(None))
             self.assertEqual({row['chapter_id'] for row in self.db.list_project_videos(project_id)},
-                             {None, chapter_id})
+                             {chapter_id})
             self.assertEqual([row['chapter_id'] for row in self.db.list_project_videos(other_project)],
                              [other_chapter])
             asyncio.run(move.on_click(None))

@@ -55,6 +55,8 @@ class VideoDatabase:
                     id INTEGER PRIMARY KEY,
                     project_id INTEGER NOT NULL REFERENCES projects(id),
                     title TEXT NOT NULL,
+                    keyword TEXT NOT NULL DEFAULT '',
+                    keyword_locked INTEGER NOT NULL DEFAULT 0,
                     position INTEGER NOT NULL,
                     created_at REAL NOT NULL,
                     UNIQUE(project_id, position)
@@ -93,6 +95,11 @@ class VideoDatabase:
             columns = {row[1] for row in db.execute("PRAGMA table_info(videos)")}
             if "hidden_at" not in columns:
                 db.execute("ALTER TABLE videos ADD COLUMN hidden_at REAL")
+            chapter_columns = {row[1] for row in db.execute("PRAGMA table_info(chapters)")}
+            if "keyword" not in chapter_columns:
+                db.execute("ALTER TABLE chapters ADD COLUMN keyword TEXT NOT NULL DEFAULT ''")
+            if "keyword_locked" not in chapter_columns:
+                db.execute("ALTER TABLE chapters ADD COLUMN keyword_locked INTEGER NOT NULL DEFAULT 0")
             placement_columns = {row[1] for row in db.execute("PRAGMA table_info(video_placements)")}
             if "id" not in placement_columns:
                 db.execute("BEGIN IMMEDIATE")
@@ -502,15 +509,26 @@ class VideoDatabase:
 
     def list_chapters(self, project_id: int) -> list[dict]:
         with self.connect() as db:
-            rows = db.execute("""SELECT id, project_id, title, position, created_at
+            rows = db.execute("""SELECT id, project_id, title, keyword, keyword_locked,
+                position, created_at
                 FROM chapters WHERE project_id=? ORDER BY position, id""", (project_id,)).fetchall()
         return [dict(row) for row in rows]
 
     def list_all_chapters(self) -> list[dict]:
         with self.connect() as db:
-            rows = db.execute("""SELECT id, project_id, title, position, created_at
+            rows = db.execute("""SELECT id, project_id, title, keyword, keyword_locked,
+                position, created_at
                 FROM chapters ORDER BY project_id, position, id""").fetchall()
         return [dict(row) for row in rows]
+
+    def update_chapter_keyword(self, project_id: int, chapter_id: int,
+                               keyword: str, locked: bool) -> None:
+        with self.connect() as db:
+            cursor = db.execute("""UPDATE chapters SET keyword=?, keyword_locked=?
+                WHERE id=? AND project_id=?""",
+                                (keyword.strip(), int(locked), chapter_id, project_id))
+            if cursor.rowcount != 1:
+                raise ValueError("Chapter không còn tồn tại trong project đã chọn.")
 
     def delete_chapter(self, project_id: int, chapter_id: int) -> int:
         """Delete a chapter, keeping its videos assigned to the parent project."""

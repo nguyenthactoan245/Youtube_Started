@@ -19,7 +19,8 @@ _lock = Lock()
 _labels = {}
 _session = uuid.uuid4().hex[:8]
 _fields = {'stage', 'status', 'kind', 'limit', 'remaining', 'reset', 'retry_after',
-           'elapsed_ms', 'key_label', 'video_id', 'error_type'}
+           'elapsed_ms', 'key_label', 'video_id', 'error_type', 'chapter_id',
+           'keyword_index'}
 
 
 def key_label(key):
