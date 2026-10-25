@@ -507,6 +507,60 @@ class VideoDatabase:
                 VALUES (?, ?, ?, ?)""", (project_id, title, position, time.time()))
             return cursor.lastrowid
 
+    def import_keyword_chapters(
+            self, project_id: int, chapters: list[tuple[str, str]]) -> tuple[int, int]:
+        """Create missing chapters and refresh keywords for matching titles atomically."""
+        if not chapters:
+            raise ValueError("File Word không có chapter để import.")
+        cleaned: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for title, keyword in chapters:
+            clean_title = title.strip()
+            clean_keyword = keyword.strip()
+            if not 1 <= len(clean_title) <= 120:
+                raise ValueError("Tên chapter phải có từ 1 đến 120 ký tự.")
+            if not clean_keyword:
+                raise ValueError(f"Chapter không có keyword: {clean_title}")
+            identity = clean_title.casefold()
+            if identity in seen:
+                raise ValueError(f"Tên chapter bị trùng trong file: {clean_title}")
+            seen.add(identity)
+            cleaned.append((clean_title, clean_keyword))
+
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone():
+                raise ValueError("Project không còn tồn tại.")
+            existing = {
+                row["title"].casefold(): row["id"]
+                for row in db.execute(
+                    "SELECT id, title FROM chapters WHERE project_id=?", (project_id,)).fetchall()
+            }
+            position = db.execute(
+                "SELECT COALESCE(MAX(position), 0) FROM chapters WHERE project_id=?",
+                (project_id,),
+            ).fetchone()[0]
+            created = updated = 0
+            now = time.time()
+            for title, keyword in cleaned:
+                chapter_id = existing.get(title.casefold())
+                if chapter_id is not None:
+                    db.execute(
+                        "UPDATE chapters SET keyword=?, keyword_locked=0 WHERE id=?",
+                        (keyword, chapter_id),
+                    )
+                    updated += 1
+                    continue
+                position += 1
+                db.execute(
+                    """INSERT INTO chapters
+                       (project_id, title, keyword, keyword_locked, position, created_at)
+                       VALUES (?, ?, ?, 0, ?, ?)""",
+                    (project_id, title, keyword, position, now),
+                )
+                created += 1
+            return created, updated
+
     def list_chapters(self, project_id: int) -> list[dict]:
         with self.connect() as db:
             rows = db.execute("""SELECT id, project_id, title, keyword, keyword_locked,
@@ -553,6 +607,53 @@ class VideoDatabase:
             db.execute("DELETE FROM ordered_videos WHERE project_id=? AND chapter_id=?",
                        (project_id, chapter_id))
             db.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
+        return affected
+
+    def delete_chapters(self, project_id: int, chapter_ids: list[int]) -> int:
+        """Delete multiple chapters atomically while preserving parent placements."""
+        ids = sorted(set(chapter_ids))
+        if not ids:
+            raise ValueError("Hãy chọn ít nhất một chapter để xóa.")
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            found = db.execute(
+                f"SELECT COUNT(*) FROM chapters WHERE project_id=? AND id IN ({placeholders})",
+                [project_id, *ids],
+            ).fetchone()[0]
+            if found != len(ids):
+                raise ValueError("Một hoặc nhiều chapter không còn thuộc project này.")
+            affected = db.execute(
+                f"""SELECT COUNT(*) FROM video_placements
+                    WHERE project_id=? AND chapter_id IN ({placeholders})""",
+                [project_id, *ids],
+            ).fetchone()[0]
+            db.execute(
+                f"""INSERT OR IGNORE INTO video_placements
+                    (video_record_id, project_id, chapter_id, assigned_at)
+                    SELECT video_record_id, project_id, NULL, MIN(assigned_at)
+                    FROM video_placements
+                    WHERE project_id=? AND chapter_id IN ({placeholders})
+                    GROUP BY video_record_id, project_id""",
+                [project_id, *ids],
+            )
+            db.execute(
+                f"DELETE FROM video_placements "
+                f"WHERE project_id=? AND chapter_id IN ({placeholders})",
+                [project_id, *ids],
+            )
+            db.execute(
+                f"DELETE FROM edit_videos WHERE project_id=? AND chapter_id IN ({placeholders})",
+                [project_id, *ids],
+            )
+            db.execute(
+                f"DELETE FROM ordered_videos WHERE project_id=? AND chapter_id IN ({placeholders})",
+                [project_id, *ids],
+            )
+            db.execute(
+                f"DELETE FROM chapters WHERE project_id=? AND id IN ({placeholders})",
+                [project_id, *ids],
+            )
         return affected
 
     def delete_project(self, project_id: int) -> int:

@@ -194,6 +194,9 @@ class DatabaseTests(unittest.TestCase):
             def pop_dialog(self):
                 self.dialog = None
 
+            def pop_dialog(self):
+                self.dialog = None
+
         page = Page()
         with patch.object(main, 'VideoDatabase', return_value=self.db), \
              patch.object(main, 'ROOT', self.root), patch.object(main, 'LIBRARY_ROOT', self.library), \
@@ -264,6 +267,27 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(self.db.list_project_videos(project_id), [])
         self.assertTrue(file.is_file())
         self.assertEqual([row['id'] for row in self.db.library()], [record_id])
+
+    def test_delete_multiple_chapters_preserves_library_and_parent_placements(self):
+        file = self.library / 'France' / '37_1280x720.mp4'
+        file.parent.mkdir(parents=True)
+        file.write_bytes(b'video')
+        self.db.import_existing(self.library, self.root / 'downloads')
+        record_id = self.db.library()[0]['id']
+        project_id = self.db.create_project('France')
+        first = self.db.create_chapter(project_id, 'Intro')
+        second = self.db.create_chapter(project_id, 'Alps')
+        third = self.db.create_chapter(project_id, 'Paris')
+        self.db.assign_videos([record_id], project_id, first)
+        self.db.assign_videos([record_id], project_id, second)
+        with self.assertRaises(ValueError):
+            self.db.delete_chapters(project_id, [])
+        self.assertEqual(self.db.delete_chapters(project_id, [first, second]), 2)
+        self.assertEqual([row['id'] for row in self.db.list_chapters(project_id)], [third])
+        placements = self.db.list_project_videos(project_id)
+        self.assertEqual(len(placements), 1)
+        self.assertIsNone(placements[0]['chapter_id'])
+        self.assertTrue(file.is_file())
 
     def test_video_assignment_adds_multiple_targets_without_moving_mp4(self):
         file = self.library / 'Moscow' / '31_1280x720.mp4'
@@ -445,7 +469,8 @@ class DatabaseTests(unittest.TestCase):
                 asyncio.run(add_chapter.on_click(None))
             self.assertEqual([row['title'] for row in self.db.list_chapters(self.db.list_projects()[0]['id'])],
                              ['Opening', 'Main story'])
-            self.assertEqual(detail[0].value, 'Main story')
+            self.assertEqual(detail[0].controls[0].value, 'Main story')
+            self.assertEqual(detail[0].controls[1].content, 'Import Keyword')
             self.assertEqual(detail[1].value, '0 video trong chapter')
             self.assertFalse(detail[2].visible)
             chapter_download_preview = detail[4]
@@ -474,22 +499,44 @@ class DatabaseTests(unittest.TestCase):
             self.assertFalse(progress.controls[0].visible)
             project_list = side_controls[-1]
             asyncio.run(project_list.controls[0].controls[0].content.controls[1].on_click(None))
-            batch_button, batch_trim, run_sequence = detail[2].controls[1].controls
+            batch_button, batch_trim, run_sequence, select_all_chapters, \
+                delete_chapters, cancel_action = \
+                detail[2].controls[1].controls
             self.assertTrue(batch_button.visible)
             self.assertFalse(batch_button.disabled)
             self.assertEqual(batch_trim.content, 'Trim hàng loạt')
-            self.assertTrue(batch_trim.disabled)
+            self.assertFalse(batch_trim.disabled)
             self.assertEqual(run_sequence.content, 'Chạy tuần tự')
-            self.assertTrue(run_sequence.disabled)
+            self.assertFalse(run_sequence.disabled)
+            self.assertFalse(select_all_chapters.disabled)
+            self.assertEqual(select_all_chapters.content, 'Select All')
+            self.assertTrue(delete_chapters.disabled)
+            self.assertFalse(cancel_action.visible)
+            self.assertTrue(cancel_action.disabled)
             batch_button.on_click(None)
             self.assertEqual(page.dialog.title.value, 'Tải video hàng loạt')
             chapter_choice, amount, feedback = page.dialog.content.controls
             self.assertEqual([option.key for option in chapter_choice.options],
-                             ['all', str(self.db.list_chapters(self.db.list_projects()[0]['id'])[0]['id']),
+                             ['all', 'selected',
+                              str(self.db.list_chapters(self.db.list_projects()[0]['id'])[0]['id']),
                               str(self.db.list_chapters(self.db.list_projects()[0]['id'])[1]['id'])])
+            self.assertEqual(chapter_choice.options[1].text, 'Selected chapters')
             self.assertEqual(chapter_choice.value, 'all')
             self.assertEqual(amount.value, '10')
             self.assertEqual(feedback.value, '')
+            chapter_choice.value = 'selected'
+            asyncio.run(page.dialog.actions[1].on_click(None))
+            self.assertEqual(feedback.value, 'Chưa có chapter nào được tích chọn.')
+            page.pop_dialog()
+            batch_trim.on_click(None)
+            trim_fields = page.dialog.content.content.controls
+            trim_choice = trim_fields[0]
+            self.assertEqual([option.key for option in trim_choice.options[:2]],
+                             ['all', 'selected'])
+            self.assertEqual(trim_choice.options[1].text, 'Selected chapters')
+            trim_choice.value = 'selected'
+            asyncio.run(page.dialog.actions[1].on_click(None))
+            self.assertEqual(trim_fields[-1].value, 'Chưa có chapter nào được tích chọn.')
 
     def test_chapter_download_saves_to_library_assigns_chapter_and_skips_duplicates(self):
         class Page:
@@ -791,7 +838,7 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(self.db.list_project_videos(project_id), [])
             self.assertTrue(file.is_file())
             self.assertEqual([row['id'] for row in self.db.library()], [record_id])
-            self.assertEqual(project_view.controls[2].content.controls[0].value, 'Keep')
+            self.assertEqual(project_view.controls[2].content.controls[0].controls[0].value, 'Keep')
 
     def test_project_sidebar_folds_and_chapter_filters_video_grid(self):
         class Page:
@@ -805,6 +852,9 @@ class DatabaseTests(unittest.TestCase):
 
             def show_dialog(self, dialog):
                 self.dialog = dialog
+
+            def pop_dialog(self):
+                self.dialog = None
 
         for video_id in (101, 102):
             file = self.library / 'Moscow' / f'{video_id}_1280x720.mp4'
@@ -842,8 +892,40 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(project_grid.controls, [])
             self.assertFalse(chapter_tabs.visible)
             project_keyword_rows = detail[5]
+            self.assertIsInstance(project_keyword_rows, main.ft.ListView)
+            self.assertTrue(project_keyword_rows.expand)
             self.assertTrue(project_keyword_rows.visible)
             self.assertEqual(len(project_keyword_rows.controls), 2)
+            second_selector = project_keyword_rows.controls[1].content.controls[0]
+            select_all = detail[2].controls[1].controls[3]
+            delete_selected = detail[2].controls[1].controls[4]
+            self.assertTrue(delete_selected.disabled)
+            self.assertEqual(select_all.content, 'Select All')
+            select_all.on_click(None)
+            self.assertEqual(select_all.content, 'Bỏ chọn tất cả')
+            self.assertFalse(delete_selected.disabled)
+            self.assertTrue(all(
+                row.content.controls[0].icon == main.ft.Icons.CHECK_BOX
+                for row in project_keyword_rows.controls))
+            select_all.on_click(None)
+            self.assertEqual(select_all.content, 'Select All')
+            self.assertTrue(delete_selected.disabled)
+            second_selector = project_keyword_rows.controls[1].content.controls[0]
+            self.assertEqual(second_selector.icon, main.ft.Icons.CHECK_BOX_OUTLINE_BLANK)
+            self.assertEqual(second_selector.tooltip, 'Chọn chapter')
+            second_selector.on_click(SimpleNamespace(control=second_selector))
+            self.assertEqual(second_selector.icon, main.ft.Icons.CHECK_BOX)
+            self.assertEqual(second_selector.tooltip, 'Bỏ chọn chapter')
+            self.assertFalse(delete_selected.disabled)
+            self.assertEqual(len(project_keyword_rows.controls[1].content.controls), 4)
+            delete_selected.on_click(None)
+            self.assertIn('Xác nhận xóa chapter', page.dialog.title)
+            self.assertIn('Places', page.dialog.content.value)
+            page.dialog.actions[0].on_click(None)
+            self.assertIsNone(page.dialog)
+            second_selector.on_click(SimpleNamespace(control=second_selector))
+            self.assertEqual(second_selector.icon, main.ft.Icons.CHECK_BOX_OUTLINE_BLANK)
+            self.assertTrue(delete_selected.disabled)
             project_item = project_list.controls[0]
             self.assertEqual(len(project_item.controls), 3)
             project_item.controls[0].content.controls[0].on_click(None)
@@ -851,7 +933,7 @@ class DatabaseTests(unittest.TestCase):
             project_list.controls[0].controls[0].content.controls[0].on_click(None)
             self.assertEqual(len(project_list.controls[0].controls), 3)
             asyncio.run(project_list.controls[0].controls[1].on_click(None))
-            self.assertEqual(detail[0].value, 'Opening')
+            self.assertEqual(detail[0].controls[0].value, 'Opening')
             self.assertEqual([card.data for card in project_grid.controls], [record_ids[101]])
             self.assertTrue(chapter_tabs.visible)
             self.assertEqual(load.call_count, 1)
@@ -876,8 +958,8 @@ class DatabaseTests(unittest.TestCase):
             asyncio.run(project_label.on_click(None))
             self.assertEqual(project_grid.controls, [])
             self.assertTrue(project_keyword_rows.visible)
-            opening_keyword = project_keyword_rows.controls[0].content.controls[1]
-            opening_edit = project_keyword_rows.controls[0].content.controls[2]
+            opening_keyword = project_keyword_rows.controls[0].content.controls[2]
+            opening_edit = project_keyword_rows.controls[0].content.controls[3]
             opening_keyword.value = 'Ice coast'
             asyncio.run(opening_keyword.on_change(None))
             asyncio.run(opening_edit.on_click(None))

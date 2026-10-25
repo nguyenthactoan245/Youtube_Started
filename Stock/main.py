@@ -26,6 +26,7 @@ from services.catalog import select_unique
 from services.database import VideoDatabase
 from services.diagnostics import record as record_diagnostic
 from services.downloader import download_many, footage_filename, safe_folder_name
+from services.keyword_import import parse_keyword_docx
 from services.pixabay import PixabayError, PixabayAccessPause
 from services.pexels import PexelsError, select_unique as select_pexels_unique
 from services.pexels_browser import (PexelsBrowserBlocked, PexelsBrowserSearchError,
@@ -1651,6 +1652,8 @@ async def main(page: ft.Page) -> None:
     project_feedback = ft.Text(size=12, color=ft.Colors.RED_300)
     project_list = ft.ListView(expand=True, spacing=6)
     chapter_title = ft.Text("Chọn hoặc tạo project", size=28, weight=ft.FontWeight.BOLD)
+    project_import_keywords = ft.OutlinedButton(
+        "Import Keyword", icon=ft.Icons.UPLOAD_FILE, disabled=True)
     chapter_count = ft.Text("Các chapter của project sẽ xuất hiện ở đây.", color=ft.Colors.BLUE_GREY_300)
     chapter_name = ft.TextField(label="Tên chapter", hint_text="Ví dụ: Chapter 1", expand=True, disabled=True)
     chapter_create = ft.FilledButton("Thêm chapter", icon=ft.Icons.ADD, disabled=True)
@@ -1660,10 +1663,18 @@ async def main(page: ft.Page) -> None:
         "Trim hàng loạt", icon=ft.Icons.CONTENT_CUT, disabled=True)
     project_run_sequence = ft.OutlinedButton(
         "Chạy tuần tự", icon=ft.Icons.PLAYLIST_PLAY, disabled=True)
+    project_select_all_chapters = ft.OutlinedButton(
+        "Select All", icon=ft.Icons.SELECT_ALL, disabled=True)
+    project_delete_chapters = ft.OutlinedButton(
+        "Xóa chapter đã chọn", icon=ft.Icons.DELETE_OUTLINE, disabled=True)
+    project_cancel_action = ft.OutlinedButton(
+        "Hủy", icon=ft.Icons.CANCEL, disabled=True, visible=False)
     chapter_input_row = ft.Row(
         [chapter_name, chapter_create], vertical_alignment=ft.CrossAxisAlignment.END)
     project_actions_row = ft.Row(
-        [project_batch_download, project_batch_trim, project_run_sequence], spacing=8)
+        [project_batch_download, project_batch_trim, project_run_sequence,
+         project_select_all_chapters, project_delete_chapters,
+         project_cancel_action], spacing=8)
     chapter_create_row = ft.Column(
         [chapter_input_row, project_actions_row], spacing=8)
     chapter_feedback = ft.Text(size=12, color=ft.Colors.RED_300)
@@ -1686,6 +1697,7 @@ async def main(page: ft.Page) -> None:
     chapter_keyword_edit = ft.OutlinedButton(
         "Edit", icon=ft.Icons.EDIT, tooltip="Khóa keyword hiện tại")
     chapter_keyword_states: dict[int, dict[str, object]] = {}
+    selected_keyword_chapters: set[int] = set()
     chapter_download_status = ft.Text(
         "Video tải thành công sẽ được lưu vào Library và chapter này.",
         size=12, color=ft.Colors.BLUE_GREY_400)
@@ -1693,6 +1705,7 @@ async def main(page: ft.Page) -> None:
     chapter_download_count = ft.Text(
         "", size=12, color=ft.Colors.BLUE_GREY_300, visible=False)
     chapter_cancel_event: Event | None = None
+    project_action_cancel_event: Event | None = None
     chapter_download_preview = ft.Column(
         visible=False, spacing=5,
         controls=[
@@ -1705,7 +1718,8 @@ async def main(page: ft.Page) -> None:
                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
         ],
     )
-    project_chapter_keywords = ft.Column(visible=False, spacing=10)
+    project_chapter_keywords = ft.ListView(
+        expand=True, visible=False, spacing=10, padding=ft.Padding.only(bottom=12))
     project_batch_status = ft.Text(
         "", size=12, weight=ft.FontWeight.W_600, color=ft.Colors.BLUE_200,
         expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
@@ -2504,17 +2518,59 @@ async def main(page: ft.Page) -> None:
         project_chapter_keywords.controls.clear()
         if selected_project_id is None or selected_chapter_id is not None:
             project_chapter_keywords.visible = False
+            project_select_all_chapters.disabled = True
+            project_delete_chapters.disabled = True
             return
         project_chapter_keywords.visible = True
         chapters = project_chapters.get(selected_project_id, [])
         if not chapters:
+            project_select_all_chapters.disabled = True
+            project_delete_chapters.disabled = True
             project_chapter_keywords.controls.append(ft.Text(
                 "Project chưa có chapter. Hãy tạo chapter để thiết lập keyword.",
                 color=ft.Colors.BLUE_GREY_300))
             return
+
+        def update_selected_chapter_action() -> None:
+            visible_ids = {row["id"] for row in chapters}
+            all_selected = visible_ids.issubset(selected_keyword_chapters)
+            project_select_all_chapters.disabled = structure_busy
+            project_select_all_chapters.content = (
+                "Bỏ chọn tất cả" if all_selected else "Select All")
+            project_select_all_chapters.icon = (
+                ft.Icons.DESELECT if all_selected else ft.Icons.SELECT_ALL)
+            project_delete_chapters.disabled = not bool(
+                selected_keyword_chapters & visible_ids) or structure_busy
+
+        def toggle_chapter_row(event: ft.ControlEvent) -> None:
+            chapter_id = int(event.control.data)
+            if chapter_id in selected_keyword_chapters:
+                selected_keyword_chapters.remove(chapter_id)
+            else:
+                selected_keyword_chapters.add(chapter_id)
+            event.control.icon = (
+                ft.Icons.CHECK_BOX if chapter_id in selected_keyword_chapters
+                else ft.Icons.CHECK_BOX_OUTLINE_BLANK)
+            event.control.icon_color = (
+                ft.Colors.CYAN_200 if chapter_id in selected_keyword_chapters
+                else ft.Colors.WHITE)
+            event.control.tooltip = (
+                "Bỏ chọn chapter" if chapter_id in selected_keyword_chapters
+                else "Chọn chapter")
+            update_selected_chapter_action()
+            patch_controls(event.control, project_delete_chapters)
+
+        update_selected_chapter_action()
+
         for chapter in chapters:
             state = chapter_keyword_state(chapter)
             locked = bool(state["locked"])
+            selected = chapter["id"] in selected_keyword_chapters
+            selector = ft.IconButton(
+                icon=ft.Icons.CHECK_BOX if selected else ft.Icons.CHECK_BOX_OUTLINE_BLANK,
+                tooltip="Bỏ chọn chapter" if selected else "Chọn chapter",
+                icon_color=ft.Colors.CYAN_200 if selected else ft.Colors.WHITE,
+                data=chapter["id"], on_click=toggle_chapter_row)
             field = ft.TextField(
                 label="Keyword", value=str(state["keyword"]), expand=True,
                 disabled=locked, text_style=None)
@@ -2571,6 +2627,7 @@ async def main(page: ft.Page) -> None:
             project_chapter_keywords.controls.append(ft.Container(
                 padding=ft.Padding.all(12), border_radius=10, bgcolor="#131c33",
                 content=ft.Row([
+                    selector,
                     ft.Text(chapter["title"], width=220, weight=ft.FontWeight.W_600,
                             max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
                             tooltip=chapter["title"]),
@@ -2651,6 +2708,8 @@ async def main(page: ft.Page) -> None:
             page.update()
             try:
                 if chapter_id is None:
+                    selected_keyword_chapters.difference_update(
+                        row["id"] for row in project_chapters.get(project_id, []))
                     await asyncio.to_thread(database.delete_project, project_id)
                     expanded_projects.discard(project_id)
                     if selected_project_id == project_id:
@@ -2658,6 +2717,7 @@ async def main(page: ft.Page) -> None:
                         selected_chapter_id = None
                 else:
                     await asyncio.to_thread(database.delete_chapter, project_id, chapter_id)
+                    selected_keyword_chapters.discard(chapter_id)
                     if selected_project_id == project_id and selected_chapter_id == chapter_id:
                         selected_chapter_id = None
                 invalidate_all_edit_scopes()
@@ -2679,6 +2739,77 @@ async def main(page: ft.Page) -> None:
                      ft.FilledButton(f"Xóa {kind}", icon=ft.Icons.DELETE_OUTLINE,
                                      on_click=confirm)],
         ))
+
+    def confirm_selected_chapter_delete(_: ft.ControlEvent) -> None:
+        project_id = selected_project_id
+        if project_id is None or selected_chapter_id is not None or structure_busy:
+            return
+        project_ids = {row["id"] for row in project_chapters.get(project_id, [])}
+        chapter_ids = sorted(selected_keyword_chapters & project_ids)
+        if not chapter_ids:
+            return
+        names = [row["title"] for row in project_chapters.get(project_id, [])
+                 if row["id"] in chapter_ids]
+
+        def cancel(_: ft.ControlEvent) -> None:
+            page.pop_dialog()
+
+        async def confirm(_: ft.ControlEvent) -> None:
+            nonlocal structure_busy
+            page.pop_dialog()
+            if structure_busy:
+                return
+            structure_busy = True
+            project_delete_chapters.disabled = True
+            project_feedback.value = f"Đang xóa {len(chapter_ids)} chapter..."
+            project_feedback.color = ft.Colors.BLUE_200
+            page.update()
+            try:
+                await asyncio.to_thread(database.delete_chapters, project_id, chapter_ids)
+                selected_keyword_chapters.difference_update(chapter_ids)
+                invalidate_all_edit_scopes()
+                project_entry_cache.pop(project_id, None)
+                if await refresh_projects(preferred_id=project_id):
+                    project_feedback.value = (
+                        f"Đã xóa {len(chapter_ids)} chapter đã chọn. Video vẫn ở Library.")
+                    project_feedback.color = ft.Colors.GREEN_300
+            except (ValueError, sqlite3.Error) as exc:
+                project_feedback.value = str(exc)
+                project_feedback.color = ft.Colors.RED_300
+            finally:
+                structure_busy = False
+                render_project_sidebar()
+                render_project_chapter_keywords()
+                page.update()
+
+        preview = ", ".join(names[:3]) + ("..." if len(names) > 3 else "")
+        page.show_dialog(ft.AlertDialog(
+            modal=True,
+            title="Xác nhận xóa chapter đã chọn",
+            content=ft.Text(
+                f'Xóa {len(chapter_ids)} chapter ({preview})? Video sẽ chuyển về project '
+                "và vẫn còn trong Library. Không thể khôi phục chapter."),
+            actions=[
+                ft.TextButton("Hủy", on_click=cancel),
+                ft.FilledButton("Xóa chapter", icon=ft.Icons.DELETE_OUTLINE,
+                                on_click=confirm),
+            ],
+        ))
+
+    def toggle_all_project_chapters(_: ft.ControlEvent) -> None:
+        project_id = selected_project_id
+        if project_id is None or selected_chapter_id is not None or structure_busy:
+            return
+        chapter_ids = {row["id"] for row in project_chapters.get(project_id, [])}
+        if not chapter_ids:
+            return
+        if chapter_ids.issubset(selected_keyword_chapters):
+            selected_keyword_chapters.difference_update(chapter_ids)
+        else:
+            selected_keyword_chapters.update(chapter_ids)
+        render_project_chapter_keywords()
+        patch_controls(project_select_all_chapters, project_delete_chapters,
+                       project_chapter_keywords)
 
     def render_project_sidebar() -> None:
         project_list.controls.clear()
@@ -2774,6 +2905,7 @@ async def main(page: ft.Page) -> None:
         project_batch_download.disabled = chapter_id is not None
         project_batch_trim.disabled = chapter_id is not None
         project_run_sequence.disabled = chapter_id is not None
+        project_import_keywords.disabled = False
         chapter_create_row.visible = chapter_id is None
         chapter_feedback.visible = chapter_id is None
         chapter_download_preview.visible = chapter_id is not None
@@ -2865,6 +2997,7 @@ async def main(page: ft.Page) -> None:
                 project_batch_download.disabled = True
                 project_batch_trim.disabled = True
                 project_run_sequence.disabled = True
+                project_import_keywords.disabled = True
                 chapter_create_row.visible = True
                 chapter_feedback.visible = True
                 chapter_download_preview.visible = False
@@ -2933,6 +3066,46 @@ async def main(page: ft.Page) -> None:
             chapter_feedback.color = ft.Colors.RED_300
         finally:
             chapter_create.disabled = selected_project_id is None
+            page.update()
+
+    async def on_import_project_keywords(_: ft.ControlEvent) -> None:
+        project_id = selected_project_id
+        if project_id is None or structure_busy:
+            return
+        files = await file_picker.pick_files(
+            dialog_title="Chọn file keyword theo chapter",
+            file_type=ft.FilePickerFileType.CUSTOM,
+            allowed_extensions=["docx"],
+            allow_multiple=False,
+        )
+        if not files:
+            return
+        path = getattr(files[0], "path", None)
+        if not path:
+            project_feedback.value = "Không lấy được đường dẫn file Word đã chọn."
+            project_feedback.color = ft.Colors.RED_300
+            page.update()
+            return
+        project_import_keywords.disabled = True
+        project_feedback.value = "Đang import chapter và keyword..."
+        project_feedback.color = ft.Colors.BLUE_200
+        page.update()
+        try:
+            imported = await asyncio.to_thread(parse_keyword_docx, path)
+            created, updated = await asyncio.to_thread(
+                database.import_keyword_chapters, project_id, imported)
+            chapter_keyword_states.clear()
+            await refresh_project_sidebar()
+            await select_project(project_id, None, force_reload=True)
+            project_feedback.value = (
+                f"Import thành công {len(imported)} chapter: "
+                f"tạo mới {created}, cập nhật {updated}.")
+            project_feedback.color = ft.Colors.GREEN_300
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            project_feedback.value = f"Import Keyword thất bại: {exc}"
+            project_feedback.color = ft.Colors.RED_300
+        finally:
+            project_import_keywords.disabled = selected_project_id is None
             page.update()
 
     async def begin_chapter_download(
@@ -3258,6 +3431,19 @@ async def main(page: ft.Page) -> None:
             chapter_download_status.color = ft.Colors.AMBER_300
             page.update()
 
+    def cancel_project_action(_: ft.ControlEvent) -> None:
+        if project_action_cancel_event is None:
+            return
+        project_action_cancel_event.set()
+        if chapter_cancel_event is not None:
+            chapter_cancel_event.set()
+        project_cancel_action.disabled = True
+        project_feedback.value = "Đang hủy tác vụ Project; chờ tiến trình hiện tại kết thúc an toàn..."
+        project_feedback.color = ft.Colors.AMBER_300
+        project_batch_status.value = "Đang hủy..."
+        project_batch_status.color = ft.Colors.AMBER_300
+        page.update()
+
     async def remember_chapter_keyword(_: ft.ControlEvent) -> None:
         project_id = selected_project_id
         chapter_id = selected_chapter_id
@@ -3324,7 +3510,10 @@ async def main(page: ft.Page) -> None:
 
         chapter_choice = ft.Dropdown(
             label="Chapter", value="all", width=360,
-            options=[ft.DropdownOption(key="all", text="All"), *[
+            options=[
+                ft.DropdownOption(key="all", text="All"),
+                ft.DropdownOption(key="selected", text="Selected chapters"),
+                *[
                 ft.DropdownOption(key=str(row["id"]), text=row["title"])
                 for row in chapters
             ]])
@@ -3338,6 +3527,7 @@ async def main(page: ft.Page) -> None:
 
         async def start_batch(_: ft.ControlEvent) -> None:
             nonlocal chapter_cancel_event, project_batch_project_id
+            nonlocal project_action_cancel_event
             try:
                 per_keyword_count = int(amount.value)
                 if not 1 <= per_keyword_count <= 200:
@@ -3347,11 +3537,19 @@ async def main(page: ft.Page) -> None:
                 page.update()
                 return
 
-            target_chapters = (chapters if chapter_choice.value == "all" else [
-                row for row in chapters if str(row["id"]) == chapter_choice.value
-            ])
+            if chapter_choice.value == "all":
+                target_chapters = chapters
+            elif chapter_choice.value == "selected":
+                target_chapters = [
+                    row for row in chapters if row["id"] in selected_keyword_chapters]
+            else:
+                target_chapters = [
+                    row for row in chapters if str(row["id"]) == chapter_choice.value]
             if not target_chapters:
-                feedback.value = "Hãy chọn chapter cần tải."
+                feedback.value = (
+                    "Chưa có chapter nào được tích chọn."
+                    if chapter_choice.value == "selected"
+                    else "Hãy chọn chapter cần tải.")
                 page.update()
                 return
 
@@ -3359,6 +3557,9 @@ async def main(page: ft.Page) -> None:
             project_batch_download.disabled = True
             project_batch_trim.disabled = True
             project_run_sequence.disabled = True
+            project_action_cancel_event = Event()
+            project_cancel_action.visible = True
+            project_cancel_action.disabled = False
             processed = skipped = succeeded = issues = partial = 0
             total = len(target_chapters)
             project_batch_log.controls.clear()
@@ -3374,6 +3575,8 @@ async def main(page: ft.Page) -> None:
             page.update()
             try:
                 for index, chapter in enumerate(target_chapters, start=1):
+                    if project_action_cancel_event.is_set():
+                        break
                     state = chapter_keyword_state(chapter)
                     keyword_text = str(state["keyword"]).strip()
                     keyword_count = len([
@@ -3442,7 +3645,12 @@ async def main(page: ft.Page) -> None:
                 project_batch_download.disabled = False
                 project_batch_trim.disabled = False
                 project_run_sequence.disabled = False
-                if chapter_cancel_event is not None and chapter_cancel_event.is_set():
+                project_cancel_action.visible = False
+                project_cancel_action.disabled = True
+                cancelled_by_user = project_action_cancel_event.is_set()
+                project_action_cancel_event = None
+                if cancelled_by_user or (chapter_cancel_event is not None
+                                         and chapter_cancel_event.is_set()):
                     project_batch_status.value = (
                         f"Đã hủy tại chapter {processed}/{total}.")
                     project_batch_status.color = ft.Colors.AMBER_300
@@ -3493,7 +3701,10 @@ async def main(page: ft.Page) -> None:
 
         chapter_choice = ft.Dropdown(
             label="Chapter", value="all", width=360,
-            options=[ft.DropdownOption(key="all", text="All"), *[
+            options=[
+                ft.DropdownOption(key="all", text="All"),
+                ft.DropdownOption(key="selected", text="Selected chapters"),
+                *[
                 ft.DropdownOption(key=str(row["id"]), text=row["title"])
                 for row in chapters
             ]])
@@ -3513,6 +3724,7 @@ async def main(page: ft.Page) -> None:
             page.pop_dialog()
 
         async def start_batch_trim(_: ft.ControlEvent) -> None:
+            nonlocal project_action_cancel_event
             try:
                 min_seconds = round(float((minimum.value or "").replace(",", ".")), 1)
                 max_seconds = round(float((maximum.value or "").replace(",", ".")), 1)
@@ -3526,11 +3738,19 @@ async def main(page: ft.Page) -> None:
                 page.update()
                 return
 
-            targets = (chapters if chapter_choice.value == "all" else [
-                row for row in chapters if str(row["id"]) == chapter_choice.value
-            ])
+            if chapter_choice.value == "all":
+                targets = chapters
+            elif chapter_choice.value == "selected":
+                targets = [
+                    row for row in chapters if row["id"] in selected_keyword_chapters]
+            else:
+                targets = [
+                    row for row in chapters if str(row["id"]) == chapter_choice.value]
             if not targets:
-                feedback.value = "Hãy chọn chapter cần trim."
+                feedback.value = (
+                    "Chưa có chapter nào được tích chọn."
+                    if chapter_choice.value == "selected"
+                    else "Hãy chọn chapter cần trim.")
                 page.update()
                 return
 
@@ -3538,10 +3758,15 @@ async def main(page: ft.Page) -> None:
             project_batch_trim.disabled = True
             project_batch_download.disabled = True
             project_run_sequence.disabled = True
+            project_action_cancel_event = Event()
+            project_cancel_action.visible = True
+            project_cancel_action.disabled = False
             completed = failed = skipped = 0
             try:
                 all_records = await asyncio.to_thread(database.list_project_videos, project_id)
                 for index, chapter in enumerate(targets, start=1):
+                    if project_action_cancel_event.is_set():
+                        break
                     chapter_id = chapter["id"]
                     records = {
                         row["id"]: row for row in all_records
@@ -3561,13 +3786,17 @@ async def main(page: ft.Page) -> None:
                     worker_count = min(len(record_ids), requested_workers)
                     semaphore = asyncio.Semaphore(worker_count)
 
-                    async def trim_one(record_id: int) -> bool:
+                    async def trim_one(record_id: int) -> bool | None:
+                        if project_action_cancel_event.is_set():
+                            return None
                         record = records[record_id]
                         source = Path(record["file_path"])
                         destination = (ROOT / "edits" / str(project_id) / str(chapter_id)
                                        / f"{record_id}_trimmed.mp4")
                         try:
                             async with semaphore:
+                                if project_action_cancel_event.is_set():
+                                    return None
                                 output, start_time, duration = await asyncio.to_thread(
                                     trim_random_video, source, destination,
                                     min_seconds, max_seconds, start_at=start_seconds)
@@ -3592,10 +3821,11 @@ async def main(page: ft.Page) -> None:
                              for record_id in record_ids]
                     chapter_completed = chapter_failed = 0
                     for position, task in enumerate(asyncio.as_completed(tasks), start=1):
-                        if await task:
+                        result = await task
+                        if result is True:
                             chapter_completed += 1
                             completed += 1
-                        else:
+                        elif result is False:
                             chapter_failed += 1
                             failed += 1
                         project_feedback.value = (
@@ -3609,11 +3839,15 @@ async def main(page: ft.Page) -> None:
                         kind="success" if not chapter_failed else "partial_success",
                         chapter_id=chapter_id, status=chapter_completed)
 
+                cancelled_by_user = project_action_cancel_event.is_set()
                 project_feedback.value = (
-                    f"Trim hàng loạt hoàn tất: {completed} thành công, {failed} lỗi"
+                    ("Đã hủy Trim hàng loạt: " if cancelled_by_user
+                     else "Trim hàng loạt hoàn tất: ")
+                    + f"{completed} thành công, {failed} lỗi"
                     + (f", {skipped} chapter trống." if skipped else "."))
                 project_feedback.color = (
-                    ft.Colors.GREEN_300 if not failed and not skipped else ft.Colors.AMBER_300)
+                    ft.Colors.GREEN_300 if not cancelled_by_user and not failed and not skipped
+                    else ft.Colors.AMBER_300)
                 project_entry_cache.pop(project_id, None)
                 await select_project(project_id, None, force_reload=True)
             except (OSError, sqlite3.Error, ValueError) as exc:
@@ -3623,6 +3857,9 @@ async def main(page: ft.Page) -> None:
                 project_batch_trim.disabled = False
                 project_batch_download.disabled = False
                 project_run_sequence.disabled = False
+                project_cancel_action.visible = False
+                project_cancel_action.disabled = True
+                project_action_cancel_event = None
                 page.update()
 
         page.show_dialog(ft.AlertDialog(
@@ -3772,6 +4009,7 @@ async def main(page: ft.Page) -> None:
 
         async def run_sequence(_: ft.ControlEvent) -> None:
             nonlocal chapter_cancel_event, project_batch_project_id
+            nonlocal project_action_cancel_event
             if not download_enabled.value and not trim_enabled.value:
                 message.value = "Hãy chọn ít nhất một action."
                 page.update()
@@ -3780,6 +4018,9 @@ async def main(page: ft.Page) -> None:
             project_batch_download.disabled = True
             project_batch_trim.disabled = True
             project_run_sequence.disabled = True
+            project_action_cancel_event = Event()
+            project_cancel_action.visible = True
+            project_cancel_action.disabled = False
             action_total = int(bool(download_enabled.value)) + int(bool(trim_enabled.value))
             action_index = 0
             project_batch_project_id = project_id
@@ -3807,6 +4048,8 @@ async def main(page: ft.Page) -> None:
                         f"▶ Action {action_index}/{action_total}: Tải hàng loạt "
                         f"({len(targets)} chapter).", size=12, color=ft.Colors.BLUE_200))
                     for chapter_position, chapter in enumerate(targets, start=1):
+                        if project_action_cancel_event.is_set():
+                            break
                         project_batch_status.value = (
                             f"Tải hàng loạt · chapter {chapter_position}/{len(targets)}: "
                             f"{chapter['title']}")
@@ -3854,7 +4097,7 @@ async def main(page: ft.Page) -> None:
                         "✓ Hoàn tất action Tải hàng loạt.", size=12,
                         color=ft.Colors.GREEN_300))
 
-                if trim_enabled.value and not (
+                if trim_enabled.value and not project_action_cancel_event.is_set() and not (
                         chapter_cancel_event is not None and chapter_cancel_event.is_set()):
                     action_index += 1
                     targets = (chapters if trim_config["chapter"] == "all" else [
@@ -3870,6 +4113,8 @@ async def main(page: ft.Page) -> None:
                         f"▶ Action {action_index}/{action_total}: Trim hàng loạt "
                         f"({len(targets)} chapter).", size=12, color=ft.Colors.BLUE_200))
                     for chapter_position, chapter in enumerate(targets, start=1):
+                        if project_action_cancel_event.is_set():
+                            break
                         chapter_id = chapter["id"]
                         records = {row["id"]: row for row in all_records
                                    if row["chapter_id"] == chapter_id}
@@ -3889,12 +4134,16 @@ async def main(page: ft.Page) -> None:
                             database.add_edit_videos, list(records), project_id, chapter_id)
                         semaphore = asyncio.Semaphore(min(len(records), requested_workers))
 
-                        async def trim_record(record_id: int) -> bool:
+                        async def trim_record(record_id: int) -> bool | None:
+                            if project_action_cancel_event.is_set():
+                                return None
                             record = records[record_id]
                             destination = (ROOT / "edits" / str(project_id) / str(chapter_id)
                                            / f"{record_id}_trimmed.mp4")
                             try:
                                 async with semaphore:
+                                    if project_action_cancel_event.is_set():
+                                        return None
                                     output, trim_start, duration = await asyncio.to_thread(
                                         trim_random_video, Path(record["file_path"]), destination,
                                         low, high, start_at=start_value)
@@ -3920,9 +4169,10 @@ async def main(page: ft.Page) -> None:
                         chapter_failed = 0
                         for video_position, task in enumerate(
                                 asyncio.as_completed(tasks), start=1):
-                            if await task:
+                            result = await task
+                            if result is True:
                                 total_completed += 1
-                            else:
+                            elif result is False:
                                 total_failed += 1
                                 chapter_failed += 1
                             project_feedback.value = (
@@ -3958,12 +4208,22 @@ async def main(page: ft.Page) -> None:
                 elif download_enabled.value:
                     project_feedback.value = "Chạy tuần tự hoàn tất: Tải hàng loạt."
                     project_feedback.color = ft.Colors.GREEN_300
+                cancelled_by_user = project_action_cancel_event.is_set()
+                if cancelled_by_user:
+                    project_feedback.value = "Đã hủy Chạy tuần tự. Các file hoàn tất vẫn được giữ lại."
+                    project_feedback.color = ft.Colors.AMBER_300
                 project_entry_cache.pop(project_id, None)
                 await select_project(project_id, None, force_reload=True)
-                project_batch_progress.value = 1
-                project_batch_count.value = f"{action_total}/{action_total} action"
-                project_batch_status.value = "Chạy tuần tự hoàn tất."
+                if not cancelled_by_user:
+                    project_batch_progress.value = 1
+                    project_batch_count.value = f"{action_total}/{action_total} action"
+                project_batch_status.value = (
+                    "Đã hủy Chạy tuần tự." if cancelled_by_user else "Chạy tuần tự hoàn tất.")
                 project_batch_status.color = project_feedback.color
+                if cancelled_by_user:
+                    project_batch_log.controls.append(ft.Text(
+                        "■ Đã hủy; các video hoàn tất được giữ lại.", size=12,
+                        color=ft.Colors.AMBER_300))
             except (OSError, sqlite3.Error, ValueError) as exc:
                 project_feedback.value = f"Chạy tuần tự bị lỗi: {exc}"
                 project_feedback.color = ft.Colors.RED_300
@@ -3975,6 +4235,9 @@ async def main(page: ft.Page) -> None:
                 project_batch_download.disabled = False
                 project_batch_trim.disabled = False
                 project_run_sequence.disabled = False
+                project_cancel_action.visible = False
+                project_cancel_action.disabled = True
+                project_action_cancel_event = None
                 page.update()
 
         sequence_dialog = ft.AlertDialog(
@@ -4006,6 +4269,7 @@ async def main(page: ft.Page) -> None:
     project_create.on_click = on_create_project
     chapter_name.on_submit = on_create_chapter
     chapter_create.on_click = on_create_chapter
+    project_import_keywords.on_click = on_import_project_keywords
     chapter_keyword.on_change = remember_chapter_keyword
     chapter_keyword.on_submit = begin_chapter_download
     chapter_download.on_click = begin_chapter_download
@@ -4014,6 +4278,9 @@ async def main(page: ft.Page) -> None:
     project_batch_download.on_click = show_project_batch_download
     project_batch_trim.on_click = show_project_batch_trim
     project_run_sequence.on_click = show_project_run_sequence
+    project_select_all_chapters.on_click = toggle_all_project_chapters
+    project_delete_chapters.on_click = confirm_selected_chapter_delete
+    project_cancel_action.on_click = cancel_project_action
     project_batch_log_toggle.on_click = toggle_project_batch_log
     project_sidebar = ft.Container(
         width=260, bgcolor="#10182c", padding=ft.Padding.all(12),
@@ -4106,7 +4373,10 @@ async def main(page: ft.Page) -> None:
                      padding=ft.Padding.symmetric(horizontal=20, vertical=10),
                      content=ft.Column(
             expand=True, spacing=6, controls=[
-                chapter_title, chapter_count,
+                ft.Row([chapter_title, project_import_keywords],
+                       alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                chapter_count,
                 chapter_create_row, chapter_feedback, chapter_download_preview,
                 project_chapter_keywords,
                 project_batch_panel,
