@@ -37,6 +37,19 @@ class EnvironmentTests(unittest.TestCase):
         self.assertEqual(latest[2].state, "error")
         self.assertEqual((verified, errors), (1, 1))
 
+    def test_progress_counts_latest_state_once_for_direct_crawl(self) -> None:
+        states = {1: "done", 2: "verified", 3: "downloading", 4: "rejected", 5: "error"}
+
+        direct = main.download_progress_counts(states, verification_required=True)
+        api = main.download_progress_counts(states, verification_required=False)
+
+        self.assertEqual(direct, {
+            "completed": 1, "downloading": 1, "checking": 1,
+            "rejected": 1, "errors": 1, "cancelled": 0,
+        })
+        self.assertEqual(api["completed"], 2)
+        self.assertEqual(api["checking"], 0)
+
     def test_keyword_workers_are_capped_by_keyword_count(self) -> None:
         self.assertEqual(main.keyword_worker_count(1, 10), 1)
         self.assertEqual(main.keyword_worker_count(4, 10), 4)

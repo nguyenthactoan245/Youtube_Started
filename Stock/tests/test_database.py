@@ -78,6 +78,16 @@ class DatabaseTests(unittest.TestCase):
                 self.assertFalse(reopened.reserve(video(1), 'Moscow', self.library / '1.mp4', owner))
             self.assertEqual(len(reopened.library()), 200)
 
+    def test_sort_records_follows_chapter_keyword_order_stably(self):
+        records = [
+            {"id": 1, "keyword": "Paris"},
+            {"id": 2, "keyword": "Alps"},
+            {"id": 3, "keyword": "Unknown"},
+            {"id": 4, "keyword": "alps"},
+        ]
+        ordered = main.sort_records_by_keyword_order(records, "Alps, Paris, Riviera")
+        self.assertEqual([row["id"] for row in ordered], [2, 4, 1, 3])
+
     def test_concurrent_reservation_and_retry_after_failure_cancel(self):
         owners = [self.db.start_batch(), self.db.start_batch()]
         try:
@@ -515,16 +525,19 @@ class DatabaseTests(unittest.TestCase):
             self.assertTrue(cancel_action.disabled)
             batch_button.on_click(None)
             self.assertEqual(page.dialog.title.value, 'Tải video hàng loạt')
-            chapter_choice, amount, feedback = page.dialog.content.controls
+            chapter_choice, selection_preview, amount, feedback = page.dialog.content.controls
             self.assertEqual([option.key for option in chapter_choice.options],
                              ['all', 'selected',
                               str(self.db.list_chapters(self.db.list_projects()[0]['id'])[0]['id']),
                               str(self.db.list_chapters(self.db.list_projects()[0]['id'])[1]['id'])])
-            self.assertEqual(chapter_choice.options[1].text, 'Selected chapters')
+            self.assertEqual(chapter_choice.options[1].text, 'Selected chapters (0)')
             self.assertEqual(chapter_choice.value, 'all')
+            self.assertIn('Sẽ chạy 2 chapter', selection_preview.value)
             self.assertEqual(amount.value, '10')
             self.assertEqual(feedback.value, '')
             chapter_choice.value = 'selected'
+            chapter_choice.on_select(None)
+            self.assertEqual(selection_preview.value, 'Chưa có chapter nào được tích chọn.')
             asyncio.run(page.dialog.actions[1].on_click(None))
             self.assertEqual(feedback.value, 'Chưa có chapter nào được tích chọn.')
             page.pop_dialog()
@@ -533,8 +546,10 @@ class DatabaseTests(unittest.TestCase):
             trim_choice = trim_fields[0]
             self.assertEqual([option.key for option in trim_choice.options[:2]],
                              ['all', 'selected'])
-            self.assertEqual(trim_choice.options[1].text, 'Selected chapters')
+            self.assertEqual(trim_choice.options[1].text, 'Selected chapters (0)')
             trim_choice.value = 'selected'
+            trim_choice.on_select(None)
+            self.assertEqual(trim_fields[1].value, 'Chưa có chapter nào được tích chọn.')
             asyncio.run(page.dialog.actions[1].on_click(None))
             self.assertEqual(trim_fields[-1].value, 'Chưa có chapter nào được tích chọn.')
 
@@ -666,10 +681,21 @@ class DatabaseTests(unittest.TestCase):
             settings.method_dropdown.value = 'api'
             settings.source_dropdown.value = 'pixabay'
             batch_button = detail[2].controls[1].controls[0]
+            select_all_chapters = detail[2].controls[1].controls[3]
+            delete_chapters = detail[2].controls[1].controls[4]
+            select_all_chapters.on_click(None)
             batch_button.on_click(None)
-            amount = page.dialog.content.controls[1]
+            chapter_choice = page.dialog.content.controls[0]
+            self.assertEqual(chapter_choice.options[1].text, 'Selected chapters (2)')
+            chapter_choice.value = 'selected'
+            chapter_choice.on_select(None)
+            self.assertIn('First', page.dialog.content.controls[1].value)
+            self.assertIn('Second', page.dialog.content.controls[1].value)
+            amount = page.dialog.content.controls[2]
             amount.value = '1'
             asyncio.run(page.dialog.actions[1].on_click(None))
+            self.assertEqual(select_all_chapters.content, 'Select All')
+            self.assertTrue(delete_chapters.disabled)
 
             batch_panel = detail[6]
             self.assertTrue(batch_panel.visible)
@@ -935,6 +961,13 @@ class DatabaseTests(unittest.TestCase):
             asyncio.run(project_list.controls[0].controls[1].on_click(None))
             self.assertEqual(detail[0].controls[0].value, 'Opening')
             self.assertEqual([card.data for card in project_grid.controls], [record_ids[101]])
+            card_lines = project_grid.controls[0].content.controls
+            self.assertEqual(len(card_lines), 4)
+            self.assertEqual(card_lines[1].max_lines, 1)
+            self.assertEqual(card_lines[1].overflow, main.ft.TextOverflow.ELLIPSIS)
+            self.assertEqual(card_lines[2].value, 'Keyword: Moscow')
+            self.assertEqual(card_lines[2].max_lines, 1)
+            self.assertEqual(card_lines[3].value, main.format_size(5))
             self.assertTrue(chapter_tabs.visible)
             self.assertEqual(load.call_count, 1)
             with patch.object(self.db, 'list_edit_videos',
@@ -1020,7 +1053,9 @@ class DatabaseTests(unittest.TestCase):
             asyncio.run(project_list.controls[0].controls[1].on_click(None))
             detail = project_view.controls[2].content.controls
             stock_tab = detail[-1].content.controls[1].controls[0]
-            select_all, count, delete, export, move, add_stock = stock_tab.controls[0].controls
+            select_all, count, delete, export, move, add_stock, sort_keyword = \
+                stock_tab.controls[0].controls
+            self.assertEqual(sort_keyword.content, 'Sorted by Keyword')
             self.assertEqual(count.value, '0 đã chọn')
             select_all.on_click(None)
             self.assertEqual(count.value, '2 đã chọn')
@@ -1061,6 +1096,8 @@ class DatabaseTests(unittest.TestCase):
                  patch.object(main, 'thumbnail_bytes', return_value=b'poster'):
                 asyncio.run(page.dialog.actions[1].on_click(None))
             self.assertEqual(len(edit_tab.controls[-1].controls), 2)
+            trim_card_lines = edit_tab.controls[-1].controls[0].content.controls
+            self.assertEqual(trim_card_lines[2].value, 'Keyword: Moscow')
             edit_select_all, edit_count, edit_delete = edit_tab.controls[0].controls
             self.assertEqual(edit_tab.controls[1].value, 'Trim hoàn tất: 2 thành công, 0 lỗi.')
             self.assertEqual(max_active, 2)
@@ -1068,17 +1105,29 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(detail[-1].selected_index, 1)
             order_tab = detail[-1].content.controls[1].controls[2]
             order_header = order_tab.controls[0]
-            self.assertEqual(order_header.controls[-2].icon, main.ft.Icons.SHUFFLE)
+            self.assertEqual(order_header.controls[-2].icon, main.ft.Icons.SORT)
             self.assertEqual(order_header.controls[-2].tooltip,
-                             'Order ngẫu nhiên từ kho bên trái')
+                             'Order theo thứ tự keyword')
+            order_clear = order_header.controls[-3]
+            self.assertEqual(order_clear.icon, main.ft.Icons.KEYBOARD_DOUBLE_ARROW_LEFT)
+            self.assertEqual(order_clear.tooltip,
+                             'Chuyển tất cả video về kho bên trái')
+            self.assertTrue(order_clear.disabled)
             order_row = order_tab.controls[2]
             pool_target = order_row.controls[0].content
             pool = pool_target.content.controls[1]
             ordered_list = order_row.controls[2].content.controls[1]
             self.assertEqual(len(pool.controls), 2)
-            pool_card_row = pool.controls[0].content.content
-            self.assertEqual(len(pool_card_row.controls), 2)
-            self.assertIsInstance(pool_card_row.controls[1].content.controls[0], main.ft.Image)
+            pool_card_column = pool.controls[0].content.content
+            self.assertEqual(len(pool_card_column.controls), 2)
+            drag_feedback = pool.controls[0].content_feedback
+            self.assertEqual(len(drag_feedback.content.controls), 2)
+            self.assertIsInstance(drag_feedback.content.controls[0], main.ft.Icon)
+            self.assertIsInstance(drag_feedback.content.controls[1], main.ft.Text)
+            preview_row = pool_card_column.controls[0]
+            self.assertIsInstance(preview_row.controls[1].content.controls[0], main.ft.Image)
+            self.assertEqual(pool_card_column.controls[1].value, 'Moscow')
+            self.assertEqual(pool_card_column.controls[1].text_align, main.ft.TextAlign.CENTER)
             asyncio.run(ordered_list.controls[-1].on_accept(
                 SimpleNamespace(src=pool.controls[0])))
             pool_target = order_row.controls[0].content
@@ -1092,12 +1141,26 @@ class DatabaseTests(unittest.TestCase):
             preview_stack = first_order_card.content.controls[1].content
             self.assertIsInstance(preview_stack.controls[0], main.ft.Image)
             self.assertTrue(callable(preview_stack.controls[1].content.on_click))
+            self.assertEqual(first_order_card.content.controls[2].controls[0].value,
+                             'Moscow')
+            self.assertEqual(len(first_order_card.content.controls[2].controls), 1)
             self.assertEqual(len(self.db.list_ordered_video_ids(project_id, first)), 2)
             self.assertEqual(len(pool.controls), 0)
+            self.assertFalse(order_clear.disabled)
+            asyncio.run(order_clear.on_click(None))
+            self.assertEqual(self.db.list_ordered_video_ids(project_id, first), [])
+            self.assertEqual(len(pool_target.content.controls[1].controls), 2)
+            self.assertTrue(order_clear.disabled)
+            self.assertEqual(order_tab.controls[1].value,
+                             'Đã chuyển 2 video về kho video trim.')
+            ordered_list = order_row.controls[2].content.controls[1]
+            asyncio.run(ordered_list.controls[-1].on_accept(
+                SimpleNamespace(src=pool_target.content.controls[1].controls[0])))
+            self.assertEqual(len(self.db.list_ordered_video_ids(project_id, first)), 1)
             asyncio.run(pool_target.on_accept(
                 SimpleNamespace(src=ordered_list.controls[1])))
-            self.assertEqual(len(self.db.list_ordered_video_ids(project_id, first)), 1)
-            self.assertEqual(len(pool_target.content.controls[1].controls), 1)
+            self.assertEqual(len(self.db.list_ordered_video_ids(project_id, first)), 0)
+            self.assertEqual(len(pool_target.content.controls[1].controls), 2)
             edit_select_all.on_click(None)
             self.assertEqual(edit_count.value, '2 đã chọn')
             asyncio.run(edit_delete.on_click(None))

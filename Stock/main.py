@@ -77,6 +77,21 @@ def summarize_download_events(
     return latest, verified, errors
 
 
+def download_progress_counts(
+        states: dict[int, str], *, verification_required: bool) -> dict[str, int]:
+    """Count each candidate once from its latest download/verification state."""
+    completed_states = {"verified"} if verification_required else {"done", "verified"}
+    return {
+        "completed": sum(state in completed_states for state in states.values()),
+        "downloading": sum(state == "downloading" for state in states.values()),
+        "checking": sum(verification_required and state == "done"
+                        for state in states.values()),
+        "rejected": sum(state == "rejected" for state in states.values()),
+        "errors": sum(state == "error" for state in states.values()),
+        "cancelled": sum(state == "cancelled" for state in states.values()),
+    }
+
+
 def choose_random_order_ids(available_ids: list[int], amount: int,
                             chooser: random.Random | None = None) -> list[int]:
     """Choose unique pool videos in randomized order without mutating the pool."""
@@ -149,6 +164,20 @@ def format_record_media_info(record: dict) -> str:
     if record.get("exists_on_disk"):
         parts.append(format_size(record.get("size_on_disk", 0)))
     return " · ".join(part for part in parts if part)
+
+
+def sort_records_by_keyword_order(records: list[dict], keyword_text: str) -> list[dict]:
+    """Stable-sort videos by the comma-separated keyword order configured on a chapter."""
+    order = {
+        keyword.casefold(): position
+        for position, keyword in enumerate(
+            part.strip() for part in keyword_text.split(",") if part.strip())
+    }
+    fallback = len(order)
+    return sorted(
+        records,
+        key=lambda record: order.get(str(record.get("keyword") or "").strip().casefold(), fallback),
+    )
 
 
 def format_duration(seconds: int) -> str:
@@ -1142,7 +1171,7 @@ async def main(page: ft.Page) -> None:
                 return accepted_videos, attempted, rejected, skipped
 
             worker = asyncio.create_task(asyncio.to_thread(search_and_download))
-            verified_count = 0
+            event_states: dict[int, str] = {}
             failed = 0
             while not worker.done() or not queue.empty():
                 try:
@@ -1152,9 +1181,12 @@ async def main(page: ft.Page) -> None:
                 events = [first_event]
                 while not queue.empty():
                     events.append(queue.get_nowait())
-                latest_by_video, newly_verified, new_errors = summarize_download_events(events)
-                verified_count += newly_verified
-                failed += new_errors
+                latest_by_video, _, _ = summarize_download_events(events)
+                event_states.update(
+                    (video_id, event.state) for video_id, event in latest_by_video.items())
+                counts = download_progress_counts(event_states, verification_required=True)
+                verified_count = counts["completed"]
+                failed = counts["errors"]
                 for event in latest_by_video.values():
                     for progress, label in cards.get(event.video_id, []):
                         progress.value = event.progress
@@ -1169,7 +1201,11 @@ async def main(page: ft.Page) -> None:
                 overall.value = min(1.0, verified_count / count)
                 overall_count.value = format_progress_timing(
                     verified_count, count, progress_started_at)
-                status.value = f"Đang tải {verified_count}/{count}"
+                status.value = (
+                    f"Đã xác thực {verified_count}/{count} · "
+                    f"đang tải {counts['downloading']} · "
+                    f"chờ kiểm tra {counts['checking']} · "
+                    f"đã loại {counts['rejected']} · lỗi {counts['errors']}")
                 patch_controls(status, overall, overall_count)
 
             selected_videos, attempted, rejected, skipped = await worker
@@ -1765,6 +1801,8 @@ async def main(page: ft.Page) -> None:
     edit_add_stock = ft.IconButton(icon=ft.Icons.CONTENT_CUT,
                                    tooltip="Trim video đã chọn", disabled=True,
                                    icon_size=20, visual_density=ft.VisualDensity.COMPACT)
+    project_sort_keyword = ft.OutlinedButton(
+        "Sort by Keyword", icon=ft.Icons.SORT, disabled=True)
     edit_status = ft.Text(size=12, color=ft.Colors.BLUE_GREY_300)
     edit_empty = ft.Text("Chưa có video trim. Chọn video ở tab Video stock rồi bấm nút Trim.",
                          color=ft.Colors.BLUE_GREY_300)
@@ -1787,10 +1825,15 @@ async def main(page: ft.Page) -> None:
     order_status = ft.Text(size=12, color=ft.Colors.BLUE_GREY_300)
     order_export = ft.IconButton(icon=ft.Icons.DOWNLOAD,
                                  tooltip="Tải video theo thứ tự", disabled=True)
-    order_random = ft.IconButton(icon=ft.Icons.SHUFFLE,
-                                 tooltip="Order ngẫu nhiên từ kho bên trái", disabled=True)
+    order_keyword = ft.IconButton(icon=ft.Icons.SORT,
+                                  tooltip="Order theo thứ tự keyword", disabled=True)
+    order_clear = ft.IconButton(icon=ft.Icons.KEYBOARD_DOUBLE_ARROW_LEFT,
+                                tooltip="Chuyển tất cả video về kho bên trái",
+                                disabled=True)
     order_thumbnail_cache: dict[str, tuple[tuple[int, int] | None, bytes | None]] = {}
     trim_thumbnail_cache: dict[str, tuple[tuple[int, int] | None, bytes | None]] = {}
+    order_save_tasks: dict[tuple[int, int | None], asyncio.Task] = {}
+    order_save_revisions: dict[tuple[int, int | None], int] = {}
     active_order_drag: dict[str, int | str | None] = {"origin": None, "record_id": None}
     selected_project_id: int | None = None
     selected_chapter_id: int | None = None
@@ -1891,8 +1934,12 @@ async def main(page: ft.Page) -> None:
                                                ft.Container(left=4, top=4, bgcolor="#99000000",
                                                             border_radius=8, content=selector)],
                                               fit=ft.StackFit.EXPAND)),
-                ft.Text(label, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
+                ft.Text(label, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
                         tooltip=label, weight=ft.FontWeight.W_600),
+                ft.Text(f"Keyword: {record.get('keyword') or '—'}", max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        tooltip=str(record.get("keyword") or "Chưa có keyword"),
+                        size=12, color=ft.Colors.BLUE_GREY_200),
                 ft.Text(format_record_media_info(record) if record["exists_on_disk"]
                         else "Thiếu file MP4", size=12,
                         color=ft.Colors.BLUE_GREY_300 if record["exists_on_disk"]
@@ -1932,8 +1979,12 @@ async def main(page: ft.Page) -> None:
                                                ft.Container(left=4, top=4, bgcolor="#99000000",
                                                             border_radius=8, content=selector)],
                                               fit=ft.StackFit.EXPAND)),
-                ft.Text(f"Trim · {label}", max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
+                ft.Text(f"Trim · {label}", max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
                         tooltip=label, weight=ft.FontWeight.W_600),
+                ft.Text(f"Keyword: {record.get('keyword') or '—'}", max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        tooltip=str(record.get("keyword") or "Chưa có keyword"),
+                        size=12, color=ft.Colors.BLUE_GREY_200),
                 ft.Text(" · ".join(filter(None, [format_record_resolution(record),
                                                   f"{duration_text}s · từ {start_text}s"])),
                         size=12, color=ft.Colors.AMBER_200),
@@ -1944,7 +1995,7 @@ async def main(page: ft.Page) -> None:
 
     def order_video_tile(record: dict, trim: dict, position: int | None = None) -> ft.Control:
         path = Path(trim["trimmed_path"])
-        label = record["details"].get("tags") or path.name
+        keyword_label = str(record.get("keyword") or "—")
         cache_key = str(path)
         fingerprint = media_file_fingerprint(path)
         cached = order_thumbnail_cache.get(cache_key)
@@ -1969,16 +2020,24 @@ async def main(page: ft.Page) -> None:
                                                     size=42, color=ft.Colors.AMBER_300))
             return ft.Container(
                 padding=ft.Padding.all(8), border_radius=8, bgcolor="#17223a", tooltip=str(path),
-                content=ft.Row(spacing=8, controls=[
-                    ft.Icon(ft.Icons.DRAG_INDICATOR, color=ft.Colors.BLUE_GREY_300),
-                    ft.Container(expand=True, aspect_ratio=16 / 9, border_radius=7,
-                                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS, bgcolor="#1d3158",
-                                 content=ft.Stack([
-                                     large_preview,
-                                     ft.Container(expand=True, alignment=ft.Alignment(0, 0),
-                                                  content=preview_button),
-                                 ], fit=ft.StackFit.EXPAND)),
-                ]),
+                content=ft.Column(spacing=6, controls=[
+                    ft.Row(spacing=8, alignment=ft.MainAxisAlignment.CENTER, controls=[
+                        ft.Icon(ft.Icons.DRAG_INDICATOR, color=ft.Colors.BLUE_GREY_300),
+                        ft.Container(width=112, height=63, border_radius=7,
+                                     clip_behavior=ft.ClipBehavior.ANTI_ALIAS, bgcolor="#1d3158",
+                                     content=ft.Stack([
+                                         large_preview,
+                                         ft.Container(expand=True, alignment=ft.Alignment(0, 0),
+                                                      content=preview_button),
+                                     ], fit=ft.StackFit.EXPAND)),
+                    ]),
+                    ft.Text(keyword_label, max_lines=1, width=180,
+                            text_align=ft.TextAlign.CENTER,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            tooltip=str(record.get("keyword") or "Chưa có keyword"),
+                            weight=ft.FontWeight.W_600,
+                            color=ft.Colors.BLUE_GREY_100),
+                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
             )
         leading = (ft.Container(width=34, height=34, border_radius=17, bgcolor="#29466f",
                                 alignment=ft.Alignment(0, 0),
@@ -1996,10 +2055,10 @@ async def main(page: ft.Page) -> None:
                                               content=preview_button),
                              ], fit=ft.StackFit.EXPAND)),
                 ft.Column(expand=True, spacing=2, controls=[
-                    ft.Text(label, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                    ft.Text(f"{float(trim['trim_duration']):.1f}s · {path.name}", size=11,
-                            color=ft.Colors.BLUE_GREY_300, max_lines=1,
-                            overflow=ft.TextOverflow.ELLIPSIS),
+                    ft.Text(keyword_label, color=ft.Colors.BLUE_GREY_100,
+                            weight=ft.FontWeight.W_600, max_lines=1,
+                            overflow=ft.TextOverflow.ELLIPSIS,
+                            tooltip=str(record.get("keyword") or "Chưa có keyword")),
                 ]),
                 ft.Column(spacing=0, controls=[
                     ft.IconButton(
@@ -2016,6 +2075,65 @@ async def main(page: ft.Page) -> None:
             ]),
         )
 
+    def order_drag_feedback(record: dict) -> ft.Control:
+        """Use a lightweight drag preview instead of rebuilding the full video card."""
+        keyword_label = str(record.get("keyword") or "—")
+        return ft.Container(
+            width=220, padding=ft.Padding.symmetric(horizontal=12, vertical=8),
+            border_radius=8, bgcolor="#29466f", opacity=0.9,
+            content=ft.Row(spacing=8, controls=[
+                ft.Icon(ft.Icons.DRAG_INDICATOR, color=ft.Colors.BLUE_GREY_100),
+                ft.Text(keyword_label, expand=True, max_lines=1,
+                        overflow=ft.TextOverflow.ELLIPSIS,
+                        color=ft.Colors.WHITE, weight=ft.FontWeight.W_600),
+            ]),
+        )
+
+    async def persist_order_after_pause(key: tuple[int, int | None], revision: int) -> None:
+        """Persist only the latest drag sequence after a short quiet period."""
+        try:
+            await asyncio.sleep(0.3)
+            if order_save_revisions.get(key) != revision:
+                return
+            sequence = list(order_sequences.get(key, []))
+            await asyncio.to_thread(database.save_ordered_video_ids, sequence, *key)
+            if order_save_revisions.get(key) != revision:
+                return
+            if key == (selected_project_id, selected_chapter_id):
+                order_status.value = "Đã lưu thứ tự video."
+                order_status.color = ft.Colors.BLUE_200
+                patch_controls(order_status)
+        except asyncio.CancelledError:
+            return
+        except (ValueError, sqlite3.Error) as exc:
+            if order_save_revisions.get(key) != revision:
+                return
+            order_sequences[key] = await asyncio.to_thread(
+                database.list_ordered_video_ids, *key)
+            if key == (selected_project_id, selected_chapter_id):
+                order_status.value = str(exc) or "Không thể lưu thứ tự video."
+                order_status.color = ft.Colors.RED_300
+                render_order_layout()
+                patch_controls(order_status, order_pool, order_list,
+                               order_clear, order_export, order_keyword)
+        finally:
+            task = order_save_tasks.get(key)
+            if task is asyncio.current_task():
+                order_save_tasks.pop(key, None)
+
+    async def queue_order_save(key: tuple[int, int | None]) -> None:
+        """Debounce database writes in Flet while keeping simple test pages synchronous."""
+        if not hasattr(page, "run_task"):
+            await asyncio.to_thread(
+                database.save_ordered_video_ids, list(order_sequences.get(key, [])), *key)
+            return
+        previous = order_save_tasks.pop(key, None)
+        if previous and not previous.done():
+            previous.cancel()
+        revision = order_save_revisions.get(key, 0) + 1
+        order_save_revisions[key] = revision
+        order_save_tasks[key] = asyncio.create_task(persist_order_after_pause(key, revision))
+
     async def save_order_drop(source_id: int, target_index: int) -> None:
         if selected_project_id is None:
             return
@@ -2029,15 +2147,16 @@ async def main(page: ft.Page) -> None:
         target_index = max(0, min(target_index, len(sequence)))
         sequence.insert(target_index, source_id)
         try:
-            await asyncio.to_thread(database.save_ordered_video_ids, sequence, *key)
-            order_status.value = "Đã lưu thứ tự video."
+            await queue_order_save(key)
+            order_status.value = "Đã cập nhật thứ tự, đang lưu..."
             order_status.color = ft.Colors.BLUE_200
         except (ValueError, sqlite3.Error) as exc:
             order_status.value = str(exc) or "Không thể lưu thứ tự video."
             order_status.color = ft.Colors.RED_300
             order_sequences[key] = await asyncio.to_thread(database.list_ordered_video_ids, *key)
         render_order_layout()
-        page.update()
+        patch_controls(order_status, order_pool, order_list,
+                       order_clear, order_export, order_keyword)
 
     def remember_order_drag(origin: str, record_id: int) -> None:
         active_order_drag["origin"] = origin
@@ -2061,15 +2180,16 @@ async def main(page: ft.Page) -> None:
             return
         sequence.remove(source_id)
         try:
-            await asyncio.to_thread(database.save_ordered_video_ids, sequence, *key)
-            order_status.value = "Đã đưa video về kho video trim."
+            await queue_order_save(key)
+            order_status.value = "Đã đưa video về kho, đang lưu..."
             order_status.color = ft.Colors.BLUE_200
         except (ValueError, sqlite3.Error) as exc:
             order_status.value = str(exc) or "Không thể cập nhật thứ tự video."
             order_status.color = ft.Colors.RED_300
             order_sequences[key] = await asyncio.to_thread(database.list_ordered_video_ids, *key)
         render_order_layout()
-        page.update()
+        patch_controls(order_status, order_pool, order_list,
+                       order_clear, order_export, order_keyword)
 
     async def move_order_item(record_id: int, delta: int) -> None:
         """Move an ordered clip one position up or down."""
@@ -2086,78 +2206,75 @@ async def main(page: ft.Page) -> None:
             return
         sequence[index], sequence[target] = sequence[target], sequence[index]
         try:
-            await asyncio.to_thread(database.save_ordered_video_ids, sequence, *key)
-            order_status.value = "Đã lưu thứ tự video."
+            await queue_order_save(key)
+            order_status.value = "Đã cập nhật thứ tự, đang lưu..."
             order_status.color = ft.Colors.BLUE_200
         except (ValueError, sqlite3.Error) as exc:
             order_status.value = str(exc) or "Không thể lưu thứ tự video."
             order_status.color = ft.Colors.RED_300
             order_sequences[key] = await asyncio.to_thread(database.list_ordered_video_ids, *key)
         render_order_layout()
-        page.update()
+        patch_controls(order_status, order_pool, order_list,
+                       order_clear, order_export, order_keyword)
 
-    def show_random_order_dialog(_: ft.ControlEvent | None = None) -> None:
+    async def order_videos_by_keyword(_: ft.ControlEvent | None = None) -> None:
         if selected_project_id is None:
             return
         key = (selected_project_id, selected_chapter_id)
         records = {row["id"]: row for row in project_entries}
         trims = edit_trim_rows.get(key, {})
-        sequence = order_sequences.get(key, [])
         available = [record_id for record_id in edit_sequences.get(key, [])
-                     if record_id in records and record_id not in sequence
+                     if record_id in records
                      and (trims.get(record_id) or {}).get("trim_status") == "completed"
                      and Path((trims.get(record_id) or {}).get("trimmed_path") or "").is_file()]
         if not available:
-            order_status.value = "Kho video trim bên trái không còn video để order."
+            order_status.value = "Chưa có video trim để order theo keyword."
             order_status.color = ft.Colors.AMBER_300
             patch_controls(order_status)
             return
-        amount = ft.TextField(label="Số lượng video", value=str(min(10, len(available))),
-                              width=180, keyboard_type=ft.KeyboardType.NUMBER)
-        message = ft.Text(size=12, color=ft.Colors.RED_300)
+        chapter = next((row for row in project_chapters.get(selected_project_id, [])
+                        if row["id"] == selected_chapter_id), None)
+        keyword_text = str(chapter_keyword_state(chapter)["keyword"]) if chapter else ""
+        ordered_records = sort_records_by_keyword_order(
+            [records[record_id] for record_id in available], keyword_text)
+        new_sequence = [record["id"] for record in ordered_records]
+        try:
+            await asyncio.to_thread(database.save_ordered_video_ids, new_sequence, *key)
+            order_sequences[key] = new_sequence
+            order_status.value = (
+                f"Đã order {len(new_sequence)} video theo thứ tự keyword của chapter.")
+            order_status.color = ft.Colors.GREEN_300
+        except (ValueError, sqlite3.Error) as exc:
+            order_status.value = str(exc) or "Không thể lưu thứ tự video theo keyword."
+            order_status.color = ft.Colors.RED_300
+        render_order_layout()
+        patch_controls(order_status, order_pool, order_list, order_export, order_keyword)
 
-        def close(_: ft.ControlEvent) -> None:
-            page.pop_dialog()
+    order_keyword.on_click = order_videos_by_keyword
 
-        async def apply(_: ft.ControlEvent) -> None:
-            try:
-                chosen = choose_random_order_ids(available, int(amount.value or "0"))
-            except (TypeError, ValueError) as exc:
-                message.value = str(exc) or "Số lượng video không hợp lệ."
-                patch_controls(message)
-                return
-            new_sequence = [*order_sequences.get(key, []), *chosen]
-            try:
-                await asyncio.to_thread(database.save_ordered_video_ids, new_sequence, *key)
-                order_sequences[key] = new_sequence
-                order_status.value = f"Đã thêm ngẫu nhiên {len(chosen)} video vào thứ tự."
-                order_status.color = ft.Colors.BLUE_200
-                page.pop_dialog()
-            except (ValueError, sqlite3.Error) as exc:
-                message.value = str(exc) or "Không thể lưu thứ tự video ngẫu nhiên."
-                patch_controls(message)
-                return
-            render_order_layout()
-            patch_controls(order_status, order_pool, order_list, order_export, order_random)
+    async def clear_ordered_videos(_: ft.ControlEvent | None = None) -> None:
+        if selected_project_id is None:
+            return
+        key = (selected_project_id, selected_chapter_id)
+        previous_sequence = list(order_sequences.get(key, []))
+        if not previous_sequence:
+            return
+        try:
+            await asyncio.to_thread(database.save_ordered_video_ids, [], *key)
+            order_sequences[key] = []
+            order_status.value = (
+                f"Đã chuyển {len(previous_sequence)} video về kho video trim.")
+            order_status.color = ft.Colors.BLUE_200
+        except (ValueError, sqlite3.Error) as exc:
+            order_status.value = str(exc) or "Không thể chuyển video về kho bên trái."
+            order_status.color = ft.Colors.RED_300
+            order_sequences[key] = await asyncio.to_thread(
+                database.list_ordered_video_ids, *key)
+        render_order_layout()
+        patch_controls(order_status, order_pool, order_list, order_clear,
+                       order_export, order_keyword)
 
-        dialog = ft.AlertDialog(
-            modal=True,
-            title="Order video ngẫu nhiên",
-            content=ft.Container(width=360, content=ft.Column(tight=True, spacing=12, controls=[
-                ft.Text(f"Có {len(available)} video trong kho bên trái.",
-                        color=ft.Colors.BLUE_GREY_300),
-                amount,
-                ft.Text("Video được chọn ngẫu nhiên sẽ nối vào cuối danh sách bên phải.",
-                        size=12, color=ft.Colors.BLUE_GREY_300),
-                message,
-            ])),
-            actions=[ft.TextButton("Hủy", on_click=close),
-                     ft.FilledButton("Order ngẫu nhiên", icon=ft.Icons.SHUFFLE,
-                                     on_click=apply)],
-        )
-        page.show_dialog(dialog)
-
-    order_random.on_click = show_random_order_dialog
+    order_clear.on_click = clear_ordered_videos
 
     def order_drop_target(index: int, content: ft.Control) -> ft.DragTarget:
         async def accept(event: ft.DragTargetEvent) -> None:
@@ -2185,6 +2302,12 @@ async def main(page: ft.Page) -> None:
                      if record_id in records and record_id in trims
                      and trims[record_id].get("trim_status") == "completed"
                      and Path(trims[record_id].get("trimmed_path") or "").is_file()]
+        chapter = next((row for row in project_chapters.get(selected_project_id, [])
+                        if row["id"] == selected_chapter_id), None)
+        keyword_text = str(chapter_keyword_state(chapter)["keyword"]) if chapter else ""
+        available_records = sort_records_by_keyword_order(
+            [records[record_id] for record_id in available], keyword_text)
+        available = [record["id"] for record in available_records]
         ordered = [record_id for record_id in order_sequences.get(key, []) if record_id in available]
         if key is not None:
             order_sequences[key] = ordered
@@ -2194,8 +2317,7 @@ async def main(page: ft.Page) -> None:
                          on_drag_start=lambda _, record_id=record_id:
                              remember_order_drag("pool", record_id),
                          content=order_video_tile(records[record_id], trims[record_id]),
-                         content_feedback=ft.Container(width=260, opacity=0.85,
-                                                       content=order_video_tile(records[record_id], trims[record_id])))
+                         content_feedback=order_drag_feedback(records[record_id]))
             for record_id in available if record_id not in ordered
         ]
         order_controls: list[ft.Control] = []
@@ -2209,9 +2331,7 @@ async def main(page: ft.Page) -> None:
                 on_drag_start=lambda _, record_id=record_id:
                     remember_order_drag("order", record_id),
                 content=order_video_tile(records[record_id], trims[record_id], index + 1),
-                content_feedback=ft.Container(width=360, opacity=0.85,
-                                              content=order_video_tile(records[record_id],
-                                                                       trims[record_id], index + 1))))
+                content_feedback=order_drag_feedback(records[record_id])))
         order_controls.append(order_drop_target(
             len(ordered), ft.Container(height=120, border=ft.Border.all(1, "#38527a"),
                                        border_radius=8, alignment=ft.Alignment(0, 0),
@@ -2219,13 +2339,18 @@ async def main(page: ft.Page) -> None:
                                                        color=ft.Colors.BLUE_GREY_300))))
         order_list.controls[:] = order_controls
         order_export.disabled = not ordered or action_busy
-        order_random.disabled = not any(record_id in available and record_id not in ordered
-                                        for record_id in available) or action_busy
+        order_clear.disabled = not ordered or action_busy
+        order_keyword.disabled = not available or action_busy
 
     def render_edit_grid() -> None:
         key = (selected_project_id, selected_chapter_id) if selected_project_id is not None else None
         ids = edit_sequences.get(key, []) if key is not None else []
         records = {row["id"]: row for row in project_entries}
+        chapter = next((row for row in project_chapters.get(selected_project_id, [])
+                        if row["id"] == selected_chapter_id), None)
+        keyword_text = str(chapter_keyword_state(chapter)["keyword"]) if chapter else ""
+        ids = [record["id"] for record in sort_records_by_keyword_order(
+            [records[record_id] for record_id in ids if record_id in records], keyword_text)]
         trims = edit_trim_rows.get(key, {}) if key is not None else {}
         edit_select_controls.clear()
         visible_edit_ids.clear()
@@ -2478,6 +2603,7 @@ async def main(page: ft.Page) -> None:
     def project_video_card(record: dict) -> ft.Control:
         path = Path(record["file_path"])
         label = record["details"].get("tags") or path.name
+        source_keyword = str(record.get("keyword") or "").strip()
         exists = record["exists_on_disk"]
         poster = record["poster_bytes"]
         image = (ft.Image(src=poster, fit=ft.BoxFit.COVER, expand=True) if poster
@@ -2498,9 +2624,14 @@ async def main(page: ft.Page) -> None:
                                                ft.Container(left=4, top=4, bgcolor="#99000000",
                                                             border_radius=8, content=selector)],
                                               fit=ft.StackFit.EXPAND)),
-                ft.Text(label, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS,
+                ft.Text(label, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
                         tooltip=label, weight=ft.FontWeight.W_600),
-                ft.Text(format_record_media_info(record) if exists else "Thiếu file MP4",
+                ft.Text(f"Keyword: {source_keyword}" if source_keyword else "Keyword: —",
+                        max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
+                        tooltip=source_keyword or "Chưa có keyword",
+                        size=12, color=ft.Colors.BLUE_GREY_200),
+                ft.Text(format_size(record.get("size_on_disk", 0)) if exists
+                        else "Thiếu file MP4",
                         size=12, color=ft.Colors.BLUE_GREY_300 if exists else ft.Colors.AMBER_300),
             ]),
         )
@@ -2637,6 +2768,7 @@ async def main(page: ft.Page) -> None:
     def render_project_grid() -> None:
         project = next((row for row in project_rows if row["id"] == selected_project_id), None)
         if project is None:
+            project_sort_keyword.disabled = True
             project_grid.controls.clear()
             project_select_controls.clear()
             visible_project_ids.clear()
@@ -2649,6 +2781,7 @@ async def main(page: ft.Page) -> None:
                         if row["id"] == selected_chapter_id), None)
         chapter_title.value = chapter["title"] if chapter else project["name"]
         if chapter is None:
+            project_sort_keyword.disabled = True
             chapter_count.value = f"{len(project_chapters.get(project['id'], []))} chapter"
             project_select_controls.clear()
             visible_project_ids.clear()
@@ -2666,6 +2799,11 @@ async def main(page: ft.Page) -> None:
             if row["id"] not in seen_video_ids:
                 visible_records.append(row)
                 seen_video_ids.add(row["id"])
+        chapter_keyword_text = str(chapter_keyword_state(chapter)["keyword"])
+        project_sort_keyword.disabled = not visible_records or not chapter_keyword_text.strip()
+        visible_records = sort_records_by_keyword_order(visible_records, chapter_keyword_text)
+        project_sort_keyword.content = "Sorted by Keyword"
+        project_sort_keyword.icon = ft.Icons.DONE
         chapter_count.value = f"{len(visible_records)} video trong chapter"
         project_select_controls.clear()
         visible_project_ids.clear()
@@ -2676,6 +2814,12 @@ async def main(page: ft.Page) -> None:
         project_empty.visible = not visible_records
         project_empty.value = ("Chapter này chưa có video. Gắn video từ Download hoặc Library."
                                if chapter else "Project này chưa có video. Gắn video từ Download hoặc Library.")
+
+    def sort_project_videos_by_keyword(_: ft.ControlEvent) -> None:
+        if selected_project_id is None or selected_chapter_id is None:
+            return
+        render_project_grid()
+        page.update()
 
     def confirm_structure_delete(project_id: int, chapter_id: int | None = None) -> None:
         if structure_busy:
@@ -3312,7 +3456,7 @@ async def main(page: ft.Page) -> None:
 
                 worker = asyncio.create_task(asyncio.to_thread(search_and_download_api))
 
-            completed = 0
+            event_states: dict[int, str] = {}
             while not worker.done() or not queue.empty():
                 try:
                     first_event = await asyncio.wait_for(queue.get(), timeout=0.15)
@@ -3322,13 +3466,23 @@ async def main(page: ft.Page) -> None:
                 while not queue.empty():
                     events.append(queue.get_nowait())
                 for event in events:
-                    if event.state in {"done", "verified", "error", "cancelled", "rejected"}:
-                        completed += 1
-                    failed += event.state == "error"
+                    event_states[event.video_id] = event.state
+                counts = download_progress_counts(
+                    event_states, verification_required=method_name == "direct")
+                completed = counts["completed"]
+                failed = counts["errors"]
                 chapter_download_progress.value = min(1, completed / requested_count)
                 chapter_download_count.value = f"{min(completed, requested_count)}/{requested_count}"
-                chapter_download_status.value = (
-                    f"Đang tải và kiểm tra video {min(completed, requested_count)}/{requested_count}...")
+                if method_name == "direct":
+                    chapter_download_status.value = (
+                        f"Đã xác thực {min(completed, requested_count)}/{requested_count} · "
+                        f"đang tải {counts['downloading']} · "
+                        f"chờ kiểm tra {counts['checking']} · "
+                        f"đã loại {counts['rejected']} · lỗi {counts['errors']}")
+                else:
+                    chapter_download_status.value = (
+                        f"Đã tải {min(completed, requested_count)}/{requested_count} · "
+                        f"đang tải {counts['downloading']} · lỗi {counts['errors']}")
                 page.update()
 
             selected_videos, keyword_failures = await worker
@@ -3512,7 +3666,9 @@ async def main(page: ft.Page) -> None:
             label="Chapter", value="all", width=360,
             options=[
                 ft.DropdownOption(key="all", text="All"),
-                ft.DropdownOption(key="selected", text="Selected chapters"),
+                ft.DropdownOption(
+                    key="selected",
+                    text=f"Selected chapters ({len(selected_keyword_chapters & {row['id'] for row in chapters})})"),
                 *[
                 ft.DropdownOption(key=str(row["id"]), text=row["title"])
                 for row in chapters
@@ -3521,6 +3677,30 @@ async def main(page: ft.Page) -> None:
             label="Số lượng video trên mỗi keyword", value="10", width=360,
             input_filter=ft.InputFilter(allow=True, regex_string=r"[0-9]"))
         feedback = ft.Text(size=12, color=ft.Colors.RED_300)
+
+        def target_chapters() -> list[dict]:
+            if chapter_choice.value == "all":
+                return chapters
+            if chapter_choice.value == "selected":
+                return [row for row in chapters if row["id"] in selected_keyword_chapters]
+            return [row for row in chapters if str(row["id"]) == chapter_choice.value]
+
+        selection_preview = ft.Text(size=12, color=ft.Colors.BLUE_GREY_300)
+
+        def update_selection_preview(_: ft.ControlEvent | None = None) -> None:
+            targets = target_chapters()
+            names = ", ".join(row["title"] for row in targets[:4])
+            if len(targets) > 4:
+                names += ", ..."
+            selection_preview.value = (
+                f"Sẽ chạy {len(targets)} chapter: {names}" if targets
+                else "Chưa có chapter nào được tích chọn.")
+            selection_preview.color = (
+                ft.Colors.BLUE_GREY_300 if targets else ft.Colors.AMBER_300)
+            patch_controls(selection_preview)
+
+        chapter_choice.on_select = update_selection_preview
+        update_selection_preview()
 
         def close_dialog(_: ft.ControlEvent | None = None) -> None:
             page.pop_dialog()
@@ -3537,15 +3717,8 @@ async def main(page: ft.Page) -> None:
                 page.update()
                 return
 
-            if chapter_choice.value == "all":
-                target_chapters = chapters
-            elif chapter_choice.value == "selected":
-                target_chapters = [
-                    row for row in chapters if row["id"] in selected_keyword_chapters]
-            else:
-                target_chapters = [
-                    row for row in chapters if str(row["id"]) == chapter_choice.value]
-            if not target_chapters:
+            targets = target_chapters()
+            if not targets:
                 feedback.value = (
                     "Chưa có chapter nào được tích chọn."
                     if chapter_choice.value == "selected"
@@ -3553,6 +3726,8 @@ async def main(page: ft.Page) -> None:
                 page.update()
                 return
 
+            selected_keyword_chapters.difference_update(row["id"] for row in chapters)
+            render_project_chapter_keywords()
             close_dialog()
             project_batch_download.disabled = True
             project_batch_trim.disabled = True
@@ -3561,7 +3736,7 @@ async def main(page: ft.Page) -> None:
             project_cancel_action.visible = True
             project_cancel_action.disabled = False
             processed = skipped = succeeded = issues = partial = 0
-            total = len(target_chapters)
+            total = len(targets)
             project_batch_log.controls.clear()
             project_batch_log.visible = True
             project_batch_log_toggle.icon = ft.Icons.EXPAND_LESS
@@ -3574,7 +3749,7 @@ async def main(page: ft.Page) -> None:
             project_batch_status.color = ft.Colors.BLUE_200
             page.update()
             try:
-                for index, chapter in enumerate(target_chapters, start=1):
+                for index, chapter in enumerate(targets, start=1):
                     if project_action_cancel_event.is_set():
                         break
                     state = chapter_keyword_state(chapter)
@@ -3679,7 +3854,7 @@ async def main(page: ft.Page) -> None:
             title=ft.Text("Tải video hàng loạt"),
             content=ft.Column(
                 tight=True, spacing=12,
-                controls=[chapter_choice, amount, feedback]),
+                controls=[chapter_choice, selection_preview, amount, feedback]),
             actions=[
                 ft.TextButton("Hủy", on_click=close_dialog),
                 ft.FilledButton("Bắt đầu tải", icon=ft.Icons.DOWNLOAD,
@@ -3703,7 +3878,9 @@ async def main(page: ft.Page) -> None:
             label="Chapter", value="all", width=360,
             options=[
                 ft.DropdownOption(key="all", text="All"),
-                ft.DropdownOption(key="selected", text="Selected chapters"),
+                ft.DropdownOption(
+                    key="selected",
+                    text=f"Selected chapters ({len(selected_keyword_chapters & {row['id'] for row in chapters})})"),
                 *[
                 ft.DropdownOption(key=str(row["id"]), text=row["title"])
                 for row in chapters
@@ -3719,6 +3896,30 @@ async def main(page: ft.Page) -> None:
             options=[ft.DropdownOption(key=str(value), text=str(value))
                      for value in range(1, 11)])
         feedback = ft.Text(size=12, color=ft.Colors.RED_300)
+
+        def target_chapters() -> list[dict]:
+            if chapter_choice.value == "all":
+                return chapters
+            if chapter_choice.value == "selected":
+                return [row for row in chapters if row["id"] in selected_keyword_chapters]
+            return [row for row in chapters if str(row["id"]) == chapter_choice.value]
+
+        selection_preview = ft.Text(size=12, color=ft.Colors.BLUE_GREY_300)
+
+        def update_selection_preview(_: ft.ControlEvent | None = None) -> None:
+            targets = target_chapters()
+            names = ", ".join(row["title"] for row in targets[:4])
+            if len(targets) > 4:
+                names += ", ..."
+            selection_preview.value = (
+                f"Sẽ chạy {len(targets)} chapter: {names}" if targets
+                else "Chưa có chapter nào được tích chọn.")
+            selection_preview.color = (
+                ft.Colors.BLUE_GREY_300 if targets else ft.Colors.AMBER_300)
+            patch_controls(selection_preview)
+
+        chapter_choice.on_select = update_selection_preview
+        update_selection_preview()
 
         def close_dialog(_: ft.ControlEvent | None = None) -> None:
             page.pop_dialog()
@@ -3738,14 +3939,7 @@ async def main(page: ft.Page) -> None:
                 page.update()
                 return
 
-            if chapter_choice.value == "all":
-                targets = chapters
-            elif chapter_choice.value == "selected":
-                targets = [
-                    row for row in chapters if row["id"] in selected_keyword_chapters]
-            else:
-                targets = [
-                    row for row in chapters if str(row["id"]) == chapter_choice.value]
+            targets = target_chapters()
             if not targets:
                 feedback.value = (
                     "Chưa có chapter nào được tích chọn."
@@ -3754,6 +3948,8 @@ async def main(page: ft.Page) -> None:
                 page.update()
                 return
 
+            selected_keyword_chapters.difference_update(row["id"] for row in chapters)
+            render_project_chapter_keywords()
             close_dialog()
             project_batch_trim.disabled = True
             project_batch_download.disabled = True
@@ -3867,6 +4063,7 @@ async def main(page: ft.Page) -> None:
             content=ft.Container(width=370, content=ft.Column(
                 tight=True, spacing=12, controls=[
                     chapter_choice,
+                    selection_preview,
                     ft.Row([minimum, maximum]),
                     ft.Row([start_from, trim_workers]),
                     ft.Text("All sẽ trim toàn bộ video lần lượt qua từng chapter.",
@@ -4282,6 +4479,7 @@ async def main(page: ft.Page) -> None:
     project_delete_chapters.on_click = confirm_selected_chapter_delete
     project_cancel_action.on_click = cancel_project_action
     project_batch_log_toggle.on_click = toggle_project_batch_log
+    project_sort_keyword.on_click = sort_project_videos_by_keyword
     project_sidebar = ft.Container(
         width=260, bgcolor="#10182c", padding=ft.Padding.all(12),
         content=ft.Column(expand=True, spacing=12, controls=[
@@ -4307,7 +4505,8 @@ async def main(page: ft.Page) -> None:
             ft.TabBarView(expand=True, controls=[
                 ft.Column(expand=True, spacing=4, controls=[
                     ft.Row([project_select_all, project_selected_count, project_delete,
-                            project_save, project_move, edit_add_stock], spacing=4),
+                            project_save, project_move, edit_add_stock,
+                            project_sort_keyword], spacing=4),
                     project_action_status, project_empty, project_grid,
                 ]),
                 ft.Column(expand=True, spacing=12, controls=[
@@ -4317,7 +4516,7 @@ async def main(page: ft.Page) -> None:
                 ft.Column(expand=True, spacing=10, controls=[
                     ft.Row([ft.Text("Kho video trim", weight=ft.FontWeight.W_600, expand=True),
                             ft.Text("Thứ tự tải về", weight=ft.FontWeight.W_600, expand=True),
-                            order_random, order_export],
+                            order_clear, order_keyword, order_export],
                             vertical_alignment=ft.CrossAxisAlignment.CENTER),
                     order_status,
                     ft.Row(expand=True, spacing=12, controls=[

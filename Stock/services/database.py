@@ -361,7 +361,7 @@ class VideoDatabase:
 
     def list_project_videos(self, project_id: int) -> list[dict]:
         with self.connect() as db:
-            rows = db.execute("""SELECT v.id, v.file_path, v.metadata, p.chapter_id
+            rows = db.execute("""SELECT v.id, v.file_path, v.metadata, v.keyword, p.chapter_id
                 FROM video_placements p JOIN videos v ON v.id=p.video_record_id
                 WHERE p.project_id=? AND v.hidden_at IS NULL
                 ORDER BY p.assigned_at, v.id""", (project_id,)).fetchall()
