@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>Studio Sync Manager</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@500;700&amp;family=Source+Serif+4:opsz,wght@8..60,500;8..60,600&amp;display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#d97757}a:hover{color:#eb9a7f}
+button{font-family:inherit;cursor:pointer}
+button:disabled{cursor:not-allowed}
+input,textarea{font-family:inherit}
+.scroll::-webkit-scrollbar{width:10px;height:10px}
+.scroll::-webkit-scrollbar-thumb{background:rgba(150,140,125,.35);border-radius:6px;border:2px solid transparent;background-clip:content-box}
+button:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid #d97757;outline-offset:2px}
+.clamp2{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+</style>
+</helmet>
+<div style="box-sizing: border-box; width: 100%; min-height: 100vh; padding: 20px 24px 28px; display: flex; flex-direction: column; gap: 16px; background: {{c.bg}}; color: {{c.text}}; font-family: Inter, 'Segoe UI', system-ui, sans-serif; font-size: 14px">
+
+  <header style="display: flex; align-items: center; gap: 14px; flex-wrap: wrap">
+    <div style="width: 42px; height: 42px; border-radius: 11px; background: {{c.accent}}; display: flex; align-items: center; justify-content: center; flex: 0 0 auto">
+      <svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="{{c.accentInk}}" stroke-width="2.2" stroke-linecap="round"><path d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"></path></svg>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 2px; flex: 1 1 360px; min-width: 0">
+      <h1 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-weight: 600; font-size: 24px; letter-spacing: -0.01em">Studio Episodic Asset &amp; Subtitle Sync</h1>
+      <p style="margin: 0; font-size: 13px; color: {{c.muted}}">Nạp metadata, chọn tập và đồng bộ video + phụ đề đa luồng cho xưởng hậu kỳ phim ngắn</p>
+    </div>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center">
+      <span style="display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 999px; background: {{c.panel}}; border: 1px solid {{c.line}}; font-size: 12.5px; color: {{c.muted}}">
+        <span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: {{c.text}}">{{totalSel}}</span> tập đã chọn · <span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: {{c.text}}">{{seriesCount}}</span> phim
+      </span>
+      <span style="display: inline-flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 999px; background: {{c.okSoft}}; border: 1px solid {{c.line}}; font-size: 12px; font-weight: 700; letter-spacing: .04em; color: {{c.ok}}">
+        <span aria-hidden="true" style="width: 8px; height: 8px; border-radius: 50%; background: {{c.ok}}"></span>BACKEND · LIVE
+      </span>
+    </div>
+  </header>
+
+  <section aria-label="Nhập URL dự án" style="background: {{c.panel}}; border: 1px solid {{c.line}}; border-radius: 16px; padding: 16px; display: flex; gap: 14px; flex-wrap: wrap; align-items: stretch">
+    <div style="flex: 999 1 520px; min-width: 0; display: flex; flex-direction: column; gap: 8px">
+      <label for="urls" style="font-size: 12px; font-weight: 600; color: {{c.muted}}; letter-spacing: .06em; text-transform: uppercase">URL project nội bộ · mỗi dòng 1 link</label>
+      <textarea id="urls" class="scroll" value="{{urls}}" onChange="{{setUrls}}" style="resize: none; height: 72px; box-sizing: border-box; background: {{c.input}}; color: {{c.text}}; border: 1px solid {{c.line}}; border-radius: 10px; padding: 10px 12px; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; line-height: 1.5"></textarea>
+      <p style="margin: 0; font-size: 12.5px; color: {{c.faint}}">{{loadStatus}}</p>
+    </div>
+    <div style="flex: 1 1 220px; display: flex; flex-direction: column; gap: 8px; justify-content: center">
+      <button onClick="{{loadMore}}" style="height: 46px; border-radius: 11px; border: 1px solid {{c.accent}}; background: {{c.accent}}; color: {{c.accentInk}}; font-size: 14px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px">
+        <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>Nạp Danh Sách Phim
+      </button>
+      <button onClick="{{clearAll}}" style="height: 44px; border-radius: 11px; border: 1px solid {{c.line}}; background: transparent; color: {{c.muted}}; font-size: 13.5px; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 8px">
+        <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"></path></svg>Xóa Danh Sách
+      </button>
+    </div>
+  </section>
+
+  <div style="display: flex; flex-wrap: wrap; gap: 16px; align-items: stretch">
+
+    <section aria-label="Thư viện phim" style="flex: 1 1 330px; min-width: 0; background: {{c.panel}}; border: 1px solid {{c.line}}; border-radius: 16px; padding: 14px; display: flex; flex-direction: column; gap: 12px">
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 8px">
+        <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 18px; font-weight: 600">Thư viện phim</h2>
+        <span style="padding: 3px 10px; border-radius: 999px; background: {{c.panel2}}; border: 1px solid {{c.line}}; font-size: 12px; color: {{c.muted}}; font-weight: 600">{{seriesCount}} bộ</span>
+      </div>
+      <div style="position: relative">
+        <svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="{{c.faint}}" stroke-width="2" stroke-linecap="round" style="position: absolute; left: 12px; top: 14px"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+        <input aria-label="Tìm phim theo tên, ID hoặc nguồn" value="{{filter}}" onChange="{{setFilter}}" placeholder="Tìm theo tên, ID, nguồn…" style="box-sizing: border-box; width: 100%; height: 42px; padding: 0 12px 0 34px; border-radius: 10px; border: 1px solid {{c.line}}; background: {{c.input}}; color: {{c.text}}; font-size: 13px">
+      </div>
+      <div class="scroll" style="display: flex; flex-direction: column; gap: 10px; max-height: 540px; overflow: auto; padding-right: 4px">
+        <sc-if value="{{noCards}}" hint-placeholder-val="{{ false }}">
+          <div style="padding: 40px 16px; text-align: center; color: {{c.faint}}; font-size: 13.5px; line-height: 1.6; border: 1px dashed {{c.line}}; border-radius: 12px">Chưa có phim nào.<br>Dán URL ở trên rồi bấm “Nạp Danh Sách Phim”.</div>
+        </sc-if>
+        <sc-for list="{{cards}}" as="card" hint-placeholder-count="4">
+          <div style="position: relative; display: flex; gap: 12px; padding: 10px; border-radius: 12px; border: {{card.border}}; background: {{card.bg}}">
+            <button onClick="{{card.pick}}" aria-label="{{card.pickLabel}}" style="position: absolute; inset: 0; z-index: 1; border: none; background: transparent; border-radius: 12px; padding: 0"></button>
+            <div style="flex: 0 0 auto; width: 60px; height: 86px; border-radius: 8px; background: {{card.posterBg}}; display: flex; align-items: flex-end; justify-content: flex-start; padding: 7px; box-sizing: border-box">
+              <span style="font-family: 'Source Serif 4', Georgia, serif; font-weight: 600; font-size: 18px; color: rgba(255,255,255,.92)">{{card.initials}}</span>
+            </div>
+            <div style="flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 6px; padding-right: 26px">
+              <span class="clamp2" style="font-weight: 600; font-size: 14px; line-height: 1.35">{{card.title}}</span>
+              <div style="display: flex; gap: 6px; flex-wrap: wrap">
+                <span style="padding: 2px 7px; border-radius: 6px; background: {{c.infoSoft}}; color: {{c.info}}; font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700">{{card.bookId}}</span>
+                <span style="padding: 2px 7px; border-radius: 6px; background: {{c.warnSoft}}; color: {{c.warn}}; font-size: 11px; font-weight: 700">{{card.provider}}</span>
+              </div>
+              <div style="display: flex; align-items: center; gap: 8px; margin-top: auto">
+                <span style="font-size: 12px; color: {{c.muted}}; white-space: nowrap">Đã chọn <span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: {{c.accentText}}">{{card.count}}</span></span>
+                <div aria-hidden="true" style="flex: 1 1 auto; height: 4px; border-radius: 999px; background: {{c.track}}; overflow: hidden">
+                  <div style="height: 100%; width: {{card.pct}}; background: {{c.accent}}; border-radius: 999px"></div>
+                </div>
+              </div>
+            </div>
+            <button onClick="{{card.remove}}" aria-label="{{card.removeLabel}}" style="position: absolute; z-index: 2; top: 8px; right: 8px; width: 26px; height: 26px; border-radius: 7px; border: 1px solid transparent; background: transparent; color: {{c.faint}}; display: flex; align-items: center; justify-content: center; padding: 0">
+              <svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18"></path></svg>
+            </button>
+          </div>
+        </sc-for>
+      </div>
+    </section>
+
+    <section aria-label="Bộ chọn tập phim" style="flex: 999 1 560px; min-width: 0; background: {{c.panel}}; border: 1px solid {{c.line}}; border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 14px">
+      <sc-if value="{{hasCurrent}}" hint-placeholder-val="{{ true }}">
+        <div style="display: flex; gap: 16px; align-items: stretch; flex-wrap: wrap">
+          <div style="flex: 0 0 auto; width: 84px; height: 120px; border-radius: 10px; background: {{curPosterBg}}; display: flex; align-items: flex-end; padding: 9px; box-sizing: border-box">
+            <span style="font-family: 'Source Serif 4', Georgia, serif; font-weight: 600; font-size: 24px; color: rgba(255,255,255,.92)">{{curInitials}}</span>
+          </div>
+          <div style="flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 8px; justify-content: center">
+            <span style="font-size: 11.5px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: {{c.faint}}">Bộ chọn tập phim</span>
+            <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 24px; font-weight: 600; line-height: 1.2">{{curTitle}}</h2>
+            <div style="display: flex; gap: 6px; flex-wrap: wrap">
+              <span style="padding: 3px 8px; border-radius: 6px; background: {{c.infoSoft}}; color: {{c.info}}; font-family: 'JetBrains Mono', monospace; font-size: 11.5px; font-weight: 700">{{curId}}</span>
+              <span style="padding: 3px 8px; border-radius: 6px; background: {{c.warnSoft}}; color: {{c.warn}}; font-size: 11.5px; font-weight: 700">{{curProvider}}</span>
+              <span style="padding: 3px 8px; border-radius: 6px; background: {{c.panel2}}; color: {{c.muted}}; font-size: 11.5px; font-weight: 600">{{curTotal}}</span>
+            </div>
+          </div>
+          <div style="flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; justify-content: center; padding: 10px 16px; border-radius: 12px; background: {{c.accentSoft}}; border: 1px solid {{c.accentLine}}">
+            <span style="font-family: 'Source Serif 4', Georgia, serif; font-size: 36px; font-weight: 600; line-height: 1; color: {{c.accentText}}">{{curSel}}</span>
+            <span style="font-size: 12px; color: {{c.muted}}; margin-top: 4px">/ {{curCount}} tập đã chọn</span>
+          </div>
+        </div>
+
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 8px; border-radius: 12px; background: {{c.panel2}}">
+          <button onClick="{{selectAll}}" style="height: 40px; padding: 0 14px; border-radius: 9px; border: 1px solid {{c.line}}; background: {{c.panel}}; color: {{c.text}}; font-size: 13px; font-weight: 600">Chọn tất cả</button>
+          <button onClick="{{selectNone}}" style="height: 40px; padding: 0 14px; border-radius: 9px; border: 1px solid {{c.line}}; background: {{c.panel}}; color: {{c.text}}; font-size: 13px; font-weight: 600">Bỏ chọn hết</button>
+          <button onClick="{{invert}}" style="height: 40px; padding: 0 14px; border-radius: 9px; border: 1px solid {{c.line}}; background: {{c.panel}}; color: {{c.text}}; font-size: 13px; font-weight: 600">Đảo ngược</button>
+          <div aria-hidden="true" style="width: 1px; height: 26px; background: {{c.line}}; margin: 0 4px"></div>
+          <div style="flex: 1 1 200px; min-width: 0; display: flex; gap: 8px">
+            <input aria-label="Khoảng tập" value="{{range}}" onChange="{{setRange}}" onKeyDown="{{rangeKey}}" placeholder="VD: 1-15, 20, 35-42" style="flex: 1 1 auto; min-width: 0; box-sizing: border-box; height: 40px; padding: 0 12px; border-radius: 9px; border: 1px solid {{c.line}}; background: {{c.input}}; color: {{c.text}}; font-family: 'JetBrains Mono', monospace; font-size: 13px">
+            <button onClick="{{applyRange}}" style="height: 40px; padding: 0 14px; border-radius: 9px; border: 1px solid {{c.accentLine}}; background: {{c.accentSoft}}; color: {{c.accentText}}; font-size: 13px; font-weight: 700; white-space: nowrap">Áp dụng khoảng</button>
+          </div>
+        </div>
+
+        <div class="scroll" style="max-height: 352px; overflow: auto; padding: 2px 4px 2px 2px">
+          <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); gap: 8px">
+            <sc-for list="{{eps}}" as="ep" hint-placeholder-count="40">
+              <button onClick="{{ep.toggle}}" aria-pressed="{{ep.on}}" style="height: 42px; border-radius: 9px; border: 1px solid {{ep.border}}; background: {{ep.bg}}; color: {{ep.fg}}; font-size: 12.5px; font-weight: {{ep.weight}}; padding: 0">{{ep.label}}</button>
+            </sc-for>
+          </div>
+        </div>
+        <p style="margin: 0; font-size: 12px; color: {{c.faint}}">Bấm từng tập để bật/tắt · nhập khoảng rồi Enter để chọn nhanh · số “Đã chọn” trên thẻ phim cập nhật ngay.</p>
+      </sc-if>
+      <sc-if value="{{noCurrent}}" hint-placeholder-val="{{ false }}">
+        <div style="flex: 1 1 auto; min-height: 320px; display: flex; align-items: center; justify-content: center; text-align: center; color: {{c.faint}}; font-size: 14px; line-height: 1.6; border: 1px dashed {{c.line}}; border-radius: 12px">Chọn một bộ phim ở thư viện bên trái<br>để hiện lưới tập phim.</div>
+      </sc-if>
+    </section>
+
+    <aside aria-label="Cấu hình đồng bộ" style="flex: 1 1 290px; min-width: 0; background: {{c.panel}}; border: 1px solid {{c.line}}; border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 16px">
+      <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 18px; font-weight: 600">Cấu hình đồng bộ</h2>
+
+      <div style="display: flex; flex-direction: column; gap: 8px">
+        <label for="outdir" style="font-size: 12px; font-weight: 600; color: {{c.muted}}; letter-spacing: .06em; text-transform: uppercase">Thư mục lưu</label>
+        <input id="outdir" value="{{out}}" onChange="{{setOut}}" style="box-sizing: border-box; width: 100%; height: 42px; padding: 0 12px; border-radius: 10px; border: 1px solid {{c.line}}; background: {{c.input}}; color: {{c.text}}; font-family: 'JetBrains Mono', monospace; font-size: 12.5px">
+        <div style="display: flex; gap: 8px">
+          <button style="flex: 1 1 0; height: 40px; border-radius: 9px; border: 1px solid {{c.line}}; background: {{c.panel2}}; color: {{c.text}}; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 6px">
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>Chọn…
+          </button>
+          <button style="flex: 1 1 0; height: 40px; border-radius: 9px; border: 1px solid {{c.line}}; background: {{c.panel2}}; color: {{c.text}}; font-size: 13px; font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 6px">
+            <svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"></path></svg>Mở thư mục
+          </button>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 8px">
+        <label for="threads" style="font-size: 12px; font-weight: 600; color: {{c.muted}}; letter-spacing: .06em; text-transform: uppercase">Số luồng song song</label>
+        <div style="display: flex; gap: 8px; align-items: center">
+          <button onClick="{{decThreads}}" aria-label="Giảm số luồng" style="width: 42px; height: 42px; border-radius: 10px; border: 1px solid {{c.line}}; background: {{c.panel2}}; color: {{c.text}}; font-size: 18px; font-weight: 600; padding: 0">−</button>
+          <input id="threads" type="number" min="1" max="32" value="{{threads}}" onChange="{{setThreads}}" style="flex: 1 1 auto; min-width: 0; box-sizing: border-box; height: 42px; text-align: center; border-radius: 10px; border: 1px solid {{c.line}}; background: {{c.input}}; color: {{c.text}}; font-family: 'JetBrains Mono', monospace; font-size: 16px; font-weight: 700">
+          <button onClick="{{incThreads}}" aria-label="Tăng số luồng" style="width: 42px; height: 42px; border-radius: 10px; border: 1px solid {{c.line}}; background: {{c.panel2}}; color: {{c.text}}; font-size: 18px; font-weight: 600; padding: 0">+</button>
+        </div>
+        <span style="font-size: 12px; color: {{c.faint}}">Từ 1 đến 32 · mặc định 8</span>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 12px; padding: 12px; border-radius: 12px; background: {{c.panel2}}">
+        <label style="display: flex; gap: 10px; align-items: flex-start; cursor: pointer">
+          <input type="checkbox" checked="{{mux}}" onChange="{{toggleMux}}" style="width: 18px; height: 18px; margin: 1px 0 0; accent-color: {{c.accent}}">
+          <span style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13.5px; font-weight: 600">Nhúng phụ đề vào MP4</span><span style="font-size: 12px; color: {{c.faint}}">mux_subs · soft-sub track</span></span>
+        </label>
+        <label style="display: flex; gap: 10px; align-items: flex-start; cursor: pointer">
+          <input type="checkbox" checked="{{keep}}" onChange="{{toggleKeep}}" style="width: 18px; height: 18px; margin: 1px 0 0; accent-color: {{c.accent}}">
+          <span style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13.5px; font-weight: 600">Giữ file .vtt rời</span><span style="font-size: 12px; color: {{c.faint}}">keep_vtt · tiện chỉnh sửa phụ đề</span></span>
+        </label>
+        <label style="display: flex; gap: 10px; align-items: flex-start; cursor: pointer">
+          <input type="checkbox" checked="{{merge}}" onChange="{{toggleMerge}}" style="width: 18px; height: 18px; margin: 1px 0 0; accent-color: {{c.accent}}">
+          <span style="display: flex; flex-direction: column; gap: 2px"><span style="font-size: 13.5px; font-weight: 600">Gộp thêm 1 file Full Phim</span><span style="font-size: 12px; color: {{c.faint}}">merge_full · sau khi tải xong</span></span>
+        </label>
+      </div>
+
+      <div style="margin-top: auto; display: flex; flex-direction: column; gap: 10px">
+        <div style="display: flex; align-items: baseline; gap: 8px">
+          <span style="font-family: 'Source Serif 4', Georgia, serif; font-size: 32px; font-weight: 600; line-height: 1">{{totalSel}}</span>
+          <span style="font-size: 13px; color: {{c.muted}}">tập · {{filmsSel}} phim sẵn sàng</span>
+        </div>
+        <button onClick="{{start}}" disabled="{{running}}" style="height: 54px; border-radius: 12px; border: 1px solid {{c.accent}}; background: {{c.accent}}; color: {{c.accentInk}}; font-size: 14.5px; font-weight: 800; letter-spacing: .02em; display: flex; align-items: center; justify-content: center; gap: 10px; opacity: {{startOpacity}}">
+          <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5z"></path></svg>{{startLabel}}
+        </button>
+        <button onClick="{{stop}}" disabled="{{notRunning}}" style="height: 46px; border-radius: 12px; border: 1px solid {{c.err}}; background: {{c.errSoft}}; color: {{c.err}}; font-size: 14px; font-weight: 700; display: flex; align-items: center; justify-content: center; gap: 8px; opacity: {{stopOpacity}}">
+          <svg aria-hidden="true" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"></rect></svg>Dừng
+        </button>
+      </div>
+    </aside>
+  </div>
+
+  <section aria-label="Hàng đợi đồng bộ" style="background: {{c.panel}}; border: 1px solid {{c.line}}; border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 14px">
+    <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap">
+      <h2 style="margin: 0; font-family: 'Source Serif 4', Georgia, serif; font-size: 18px; font-weight: 600">Hàng đợi đồng bộ</h2>
+      <div style="display: flex; gap: 6px; flex-wrap: wrap">
+        <span style="padding: 4px 10px; border-radius: 999px; background: {{c.warnSoft}}; color: {{c.warn}}; font-size: 12px; font-weight: 700">Đang chạy {{nRun}}</span>
+        <span style="padding: 4px 10px; border-radius: 999px; background: {{c.okSoft}}; color: {{c.ok}}; font-size: 12px; font-weight: 700">Hoàn tất {{nOk}}</span>
+        <span style="padding: 4px 10px; border-radius: 999px; background: {{c.errSoft}}; color: {{c.err}}; font-size: 12px; font-weight: 700">Lỗi {{nErr}}</span>
+        <span style="padding: 4px 10px; border-radius: 999px; background: {{c.panel2}}; color: {{c.muted}}; font-size: 12px; font-weight: 700">Chờ {{nWait}}</span>
+      </div>
+    </div>
+
+    <div style="display: flex; align-items: center; gap: 14px; flex-wrap: wrap">
+      <div style="flex: 999 1 360px; min-width: 0; display: flex; flex-direction: column; gap: 6px">
+        <div style="display: flex; justify-content: space-between; font-size: 12.5px; color: {{c.muted}}">
+          <span><span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: {{c.text}}">{{nDone}} / {{nJobs}}</span> tập</span>
+          <span style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: {{c.text}}">{{pctText}}</span>
+        </div>
+        <div aria-hidden="true" style="height: 10px; border-radius: 999px; background: {{c.track}}; overflow: hidden">
+          <div style="height: 100%; width: {{pctText}}; background: {{c.accent}}; border-radius: 999px"></div>
+        </div>
+      </div>
+      <div style="flex: 1 1 auto; display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap">
+        <span style="padding: 8px 12px; border-radius: 10px; background: {{c.panel2}}; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: {{c.muted}}">Thời gian {{elapsedText}} · {{bytesText}}</span>
+        <span style="padding: 8px 14px; border-radius: 10px; background: {{c.accentSoft}}; border: 1px solid {{c.accentLine}}; font-family: 'JetBrains Mono', monospace; font-size: 14px; font-weight: 700; color: {{c.accentText}}">Tốc độ {{speedText}} MB/s</span>
+      </div>
+    </div>
+
+    <div class="scroll" style="overflow: auto; max-height: 312px; border: 1px solid {{c.line}}; border-radius: 12px">
+      <div role="table" aria-label="Chi tiết từng tập" style="min-width: 760px">
+        <div role="row" style="position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: minmax(0, 2.2fr) 84px 120px minmax(0, 2fr) 160px; gap: 12px; padding: 10px 14px; background: {{c.panel2}}; border-bottom: 1px solid {{c.line}}; font-size: 11.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: {{c.faint}}">
+          <span role="columnheader">Phim</span><span role="columnheader">Tập</span><span role="columnheader">Nguồn</span><span role="columnheader">Trạng thái</span><span role="columnheader" style="text-align: right">Dung lượng</span>
+        </div>
+        <sc-if value="{{noJobs}}" hint-placeholder-val="{{ false }}">
+          <div style="padding: 28px; text-align: center; color: {{c.faint}}; font-size: 13.5px">Hàng đợi trống · chọn tập rồi bấm “Bắt đầu đồng bộ”.</div>
+        </sc-if>
+        <sc-for list="{{rows}}" as="row" hint-placeholder-count="8">
+          <div role="row" style="display: grid; grid-template-columns: minmax(0, 2.2fr) 84px 120px minmax(0, 2fr) 160px; gap: 12px; align-items: center; padding: 9px 14px; border-bottom: 1px solid {{c.line}}; font-size: 13px">
+            <span role="cell" style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis">{{row.title}}</span>
+            <span role="cell" style="font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: {{c.muted}}">{{row.ep}}</span>
+            <span role="cell" style="color: {{c.muted}}">{{row.provider}}</span>
+            <span role="cell" style="display: flex; flex-direction: column; gap: 5px; min-width: 0">
+              <span style="display: flex; align-items: center; gap: 8px; color: {{row.color}}; font-weight: {{row.weight}}; white-space: nowrap; overflow: hidden; text-overflow: ellipsis">
+                <span aria-hidden="true" style="flex: 0 0 auto; width: 7px; height: 7px; border-radius: 50%; background: {{row.color}}"></span>{{row.status}}
+              </span>
+              <sc-if value="{{row.isRun}}" hint-placeholder-val="{{ false }}">
+                <span aria-hidden="true" style="display: block; height: 3px; border-radius: 999px; background: {{c.track}}; overflow: hidden"><span style="display: block; height: 100%; width: {{row.barW}}; background: {{c.warn}}"></span></span>
+              </sc-if>
+            </span>
+            <span role="cell" style="text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: {{c.muted}}">{{row.size}}</span>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+  </section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"theme":{"editor":"enum","options":["dark","light"],"default":"dark","section":"Giao diện"},"$preview":{"width":1440,"height":1260}}'>
+const THEMES = {
+  dark: { bg: '#1a1918', panel: '#262624', panel2: '#2f2e2b', line: '#3d3b37', text: '#f5f3ec', muted: '#bdb9ae', faint: '#a09c91', input: '#1f1e1c', accent: '#d97757', accentInk: '#1a1918', accentText: '#eb9a7f', accentSoft: 'rgba(217,119,87,0.13)', accentLine: 'rgba(217,119,87,0.55)', ok: '#93c47d', okSoft: 'rgba(147,196,125,0.12)', err: '#ef8274', errSoft: 'rgba(239,130,116,0.12)', warn: '#e6b86a', warnSoft: 'rgba(230,184,106,0.12)', info: '#a9bddf', infoSoft: 'rgba(169,189,223,0.12)', track: '#3a3834' },
+  light: { bg: '#efede4', panel: '#faf9f5', panel2: '#f2f0e9', line: '#e0dccf', text: '#141413', muted: '#57544c', faint: '#6a665d', input: '#ffffff', accent: '#b4532f', accentInk: '#ffffff', accentText: '#9c4526', accentSoft: 'rgba(180,83,47,0.09)', accentLine: 'rgba(180,83,47,0.45)', ok: '#2f7034', okSoft: 'rgba(47,112,52,0.09)', err: '#b3362b', errSoft: 'rgba(179,54,43,0.08)', warn: '#855608', warnSoft: 'rgba(133,86,8,0.09)', info: '#36578a', infoSoft: 'rgba(54,87,138,0.09)', track: '#e4e0d4' }
+};
+const POSTERS = [['#7d3f27', '#d97757'], ['#1f4a47', '#4f8f88'], ['#45304a', '#9a6aa0'], ['#45431e', '#a39a4a'], ['#26354d', '#5d7fb0'], ['#4f2626', '#b5605a']];
+const SAMPLE = [
+  { title: 'Hào Môn Thiên Kim Trở Về', bookId: '41872093', provider: 'ShortMax', total: 80, pick: [1, 15] },
+  { title: 'Thần Y Hạ Sơn', bookId: '52019384', provider: 'ReelShort', total: 65, pick: [1, 65] },
+  { title: 'Sau Ly Hôn Tôi Thành Tỷ Phú', bookId: '38817265', provider: 'DramaBox', total: 92, pick: null },
+  { title: 'Long Vương Trở Lại', bookId: '60273118', provider: 'FlexTV', total: 48, pick: [1, 48] },
+  { title: 'Cô Dâu Thay Thế', bookId: '27719034', provider: 'GoodShort', total: 72, pick: [20, 40] }
+];
+const EXTRA = [
+  { title: 'Nữ Hoàng Báo Thù', bookId: '71920455', provider: 'NetShort', total: 60, pick: [1, 60] },
+  { title: 'Định Mệnh Tái Sinh', bookId: '19283746', provider: 'ShortMax', total: 54, pick: [1, 10] },
+  { title: 'Vạn Cổ Thần Đế', bookId: '83746152', provider: 'DramaBox', total: 100, pick: [1, 100] }
+];
+const BASE_URLS = 'https://studio.internal/series/hao-mon-thien-kim\nhttps://studio.internal/series/than-y-ha-son\nhttps://studio.internal/series/sau-ly-hon\nhttps://studio.internal/series/long-vuong-tro-lai\nhttps://studio.internal/series/co-dau-thay-the';
+
+function mkSeries(s, idx) {
+  const sel = [];
+  for (let i = 1; i <= s.total; i++) sel.push(!!s.pick && i >= s.pick[0] && i <= s.pick[1]);
+  return { title: s.title, bookId: s.bookId, provider: s.provider, sel: sel, color: idx % POSTERS.length };
+}
+function pad(n) { return n < 10 ? '0' + n : String(n); }
+function initialsOf(t) { return t.split(/\s+/).slice(0, 2).map(function (w) { return w.charAt(0); }).join('').toUpperCase(); }
+function posterBg(i) { const p = POSTERS[i % POSTERS.length]; return 'linear-gradient(160deg, ' + p[0] + ', ' + p[1] + ')'; }
+function parseSpec(spec, total) {
+  const out = {};
+  const norm = String(spec || '').trim().replace(/\s*-\s*/g, '-');
+  if (!norm) return null;
+  const parts = norm.split(/[,;\s]+/);
+  for (let k = 0; k < parts.length; k++) {
+    const part = parts[k];
+    if (!part) continue;
+    const m = part.match(/^(\d+)-(\d+)$/);
+    if (m) {
+      let a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+      if (a > b) { const t = a; a = b; b = t; }
+      for (let n = a; n <= b; n++) if (n >= 1 && n <= total) out[n] = true;
+    } else if (/^\d+$/.test(part)) {
+      const n = parseInt(part, 10);
+      if (n >= 1 && n <= total) out[n] = true;
+    } else {
+      return null;
+    }
+  }
+  return out;
+}
+function fmtTime(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  return pad(Math.floor(s / 60)) + ':' + pad(s % 60);
+}
+function fmtBytes(mb) { return mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(1) + ' MB'; }
+
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    const series = SAMPLE.map(mkSeries);
+    const jobs = this.seed(this.buildJobs(series));
+    let bytes = 0;
+    jobs.forEach(function (j) { bytes += j.cur; });
+    this.state = {
+      series: series, cur: 0, filter: '', range: '', urls: BASE_URLS,
+      out: 'D:\\PostProd\\StudioSync', threads: 8, mux: true, keep: true, merge: false,
+      jobs: jobs, running: true, speed: 41.3, bytes: bytes, elapsed: 47, extra: 0, notice: ''
+    };
+  }
+  componentDidMount() { this.timer = setInterval(() => this.tick(), 500); }
+  componentWillUnmount() { clearInterval(this.timer); }
+
+  buildJobs(series) {
+    const jobs = [];
+    series.forEach(function (s) {
+      s.sel.forEach(function (on, i) {
+        if (!on) return;
+        const total = 18 + ((parseInt(s.bookId, 10) % 97 + i * 13) % 43);
+        jobs.push({ title: s.title, ep: i + 1, provider: s.provider, total: total, cur: 0, st: 'wait' });
+      });
+    });
+    return jobs;
+  }
+  seed(jobs) {
+    return jobs.map(function (j, k) {
+      if (k < 6) return Object.assign({}, j, { cur: j.total, st: 'ok' });
+      if (k === 6) return Object.assign({}, j, { cur: j.total * 0.42, st: 'err' });
+      if (k < 15) return Object.assign({}, j, { cur: j.total * (((k * 37) % 88) + 6) / 100, st: 'run' });
+      return j;
+    });
+  }
+  tick() {
+    if (!this.state.running) return;
+    const threads = Math.max(1, Math.min(32, parseInt(this.state.threads, 10) || 1));
+    const jobs = this.state.jobs.map(function (j) { return Object.assign({}, j); });
+    let active = jobs.filter(function (j) { return j.st === 'run'; }).length;
+    jobs.forEach(function (j) { if (j.st === 'wait' && active < threads) { j.st = 'run'; active++; } });
+    let moved = 0;
+    jobs.forEach(function (j) {
+      if (j.st !== 'run') return;
+      const nc = Math.min(j.total, j.cur + 1.2 + Math.random() * 3.6);
+      moved += nc - j.cur;
+      j.cur = nc;
+      if (nc >= j.total) j.st = Math.random() < 0.04 ? 'err' : 'ok';
+    });
+    const inst = moved / 0.5;
+    const speed = this.state.speed > 0 ? this.state.speed * 0.55 + inst * 0.45 : inst;
+    const still = jobs.some(function (j) { return j.st === 'run' || j.st === 'wait'; });
+    this.setState({
+      jobs: jobs, speed: still ? speed : 0, bytes: this.state.bytes + moved,
+      elapsed: this.state.elapsed + 0.5, running: still,
+      notice: still ? this.state.notice : 'Đồng bộ hoàn tất · file lưu tại ' + this.state.out
+    });
+  }
+  updateCurSel(fn) {
+    const s = this.state;
+    if (!s.series[s.cur]) return;
+    const series = s.series.slice();
+    const cs = Object.assign({}, series[s.cur]);
+    cs.sel = fn(cs.sel.slice());
+    series[s.cur] = cs;
+    this.setState({ series: series });
+  }
+  applyRange() {
+    const s = this.state;
+    const cs = s.series[s.cur];
+    if (!cs) return;
+    const set = parseSpec(s.range, cs.sel.length);
+    if (!set) { this.setState({ notice: 'Khoảng tập không hợp lệ: “' + s.range + '”' }); return; }
+    const n = Object.keys(set).length;
+    if (!n) { this.setState({ notice: 'Không có tập nào khớp với “' + s.range + '”' }); return; }
+    this.updateCurSel(function (sel) { return sel.map(function (_, i) { return !!set[i + 1]; }); });
+    this.setState({ notice: 'Đã áp dụng “' + s.range + '” → ' + n + ' tập cho “' + cs.title + '”' });
+  }
+  removeSeries(idx) {
+    const s = this.state;
+    if (s.running) { this.setState({ notice: 'Hãy dừng đồng bộ trước khi xóa phim khỏi thư viện.' }); return; }
+    const series = s.series.filter(function (_, i) { return i !== idx; });
+    let cur = s.cur > idx ? s.cur - 1 : s.cur;
+    cur = Math.max(0, Math.min(cur, series.length - 1));
+    this.setState({ series: series, cur: cur, notice: 'Đã xóa “' + s.series[idx].title + '” khỏi thư viện.' });
+  }
+
+  renderVals() {
+    const c = THEMES[this.props.theme === 'light' ? 'light' : 'dark'];
+    const s = this.state;
+    const q = s.filter.trim().toLowerCase();
+
+    const cards = [];
+    s.series.forEach((it, idx) => {
+      if (q && it.title.toLowerCase().indexOf(q) < 0 && it.bookId.indexOf(q) < 0 && it.provider.toLowerCase().indexOf(q) < 0) return;
+      const n = it.sel.filter(Boolean).length;
+      const total = it.sel.length;
+      const active = idx === s.cur;
+      cards.push({
+        title: it.title, bookId: 'ID ' + it.bookId, provider: it.provider,
+        count: n + ' / ' + total + ' tập', pct: (total ? Math.round(n * 100 / total) : 0) + '%',
+        initials: initialsOf(it.title), posterBg: posterBg(it.color),
+        border: active ? '1.5px solid ' + c.accent : '1px solid ' + c.line,
+        bg: active ? c.accentSoft : c.panel2,
+        pick: () => this.setState({ cur: idx }),
+        remove: () => this.removeSeries(idx),
+        pickLabel: 'Chọn phim ' + it.title,
+        removeLabel: 'Xóa ' + it.title + ' khỏi thư viện'
+      });
+    });
+
+    const cs = s.series[s.cur];
+    const curSelN = cs ? cs.sel.filter(Boolean).length : 0;
+    const eps = cs ? cs.sel.map((on, i) => ({
+      label: 'Tập ' + pad(i + 1), on: on,
+      bg: on ? c.accent : c.panel2, fg: on ? c.accentInk : c.muted,
+      border: on ? c.accent : c.line, weight: on ? '700' : '500',
+      toggle: () => this.updateCurSel(function (sel) { sel[i] = !sel[i]; return sel; })
+    })) : [];
+
+    let totalSel = 0, filmsSel = 0;
+    s.series.forEach(function (it) { const n = it.sel.filter(Boolean).length; totalSel += n; if (n) filmsSel++; });
+
+    let nOk = 0, nErr = 0, nRun = 0, nWait = 0, nCancel = 0;
+    s.jobs.forEach(function (j) {
+      if (j.st === 'ok') nOk++; else if (j.st === 'err') nErr++; else if (j.st === 'run') nRun++;
+      else if (j.st === 'wait') nWait++; else nCancel++;
+    });
+    const nDone = nOk + nErr + nCancel;
+    const pct = s.jobs.length ? Math.round(nDone * 100 / s.jobs.length) : 0;
+
+    const statusOf = (j) => {
+      if (j.st === 'wait') return 'Chờ xử lý';
+      if (j.st === 'ok') return 'Hoàn tất';
+      if (j.st === 'err') return 'Lỗi: HTTP 403 Forbidden';
+      if (j.st === 'cancel') return 'Đã hủy';
+      const r = j.cur / j.total;
+      if (r < 0.05) return 'Đang lấy manifest…';
+      if (r < 0.92) return 'Đang tải video…';
+      return s.mux ? 'Đang nhúng phụ đề vào MP4…' : 'Đang tải phụ đề .vtt…';
+    };
+    const colorOf = (st) => st === 'ok' ? c.ok : st === 'err' ? c.err : st === 'run' ? c.warn : c.faint;
+    const rows = s.jobs.map((j) => ({
+      title: j.title, ep: 'Tập ' + pad(j.ep), provider: j.provider,
+      status: statusOf(j), color: colorOf(j.st),
+      weight: (j.st === 'ok' || j.st === 'err') ? '600' : '500',
+      size: j.st === 'wait' ? '—' : j.cur.toFixed(1) + ' / ' + j.total.toFixed(1) + ' MB',
+      isRun: j.st === 'run', barW: Math.round(j.cur * 100 / j.total) + '%'
+    }));
+
+    const clampThreads = (v) => Math.max(1, Math.min(32, v));
+
+    return {
+      c: c,
+      urls: s.urls, setUrls: (e) => this.setState({ urls: e.target.value }),
+      loadStatus: s.notice || (s.series.length + ' bộ phim đã nạp · metadata và poster tải nền, không làm đơ giao diện'),
+      loadMore: () => {
+        if (s.extra >= EXTRA.length) { this.setState({ notice: 'Không còn URL mới để nạp (các link đã có trong thư viện).' }); return; }
+        const e = EXTRA[s.extra];
+        const series = s.series.concat([mkSeries(e, s.series.length)]);
+        this.setState({ series: series, extra: s.extra + 1, urls: s.urls + '\nhttps://studio.internal/series/' + e.bookId, notice: 'Đã nạp “' + e.title + '” · ' + e.total + ' tập' });
+      },
+      clearAll: () => {
+        if (s.running) { this.setState({ notice: 'Hãy dừng đồng bộ trước khi xóa danh sách.' }); return; }
+        this.setState({ series: [], cur: 0, jobs: [], urls: '', extra: 0, notice: 'Đã xóa danh sách.' });
+      },
+
+      seriesCount: s.series.length,
+      filter: s.filter, setFilter: (e) => this.setState({ filter: e.target.value }),
+      cards: cards, noCards: cards.length === 0,
+
+      hasCurrent: !!cs, noCurrent: !cs,
+      curTitle: cs ? cs.title : '', curId: cs ? 'ID ' + cs.bookId : '', curProvider: cs ? cs.provider : '',
+      curTotal: cs ? cs.sel.length + ' tập' : '', curSel: curSelN, curCount: cs ? cs.sel.length : 0,
+      curPosterBg: cs ? posterBg(cs.color) : c.panel2, curInitials: cs ? initialsOf(cs.title) : '',
+      eps: eps,
+      selectAll: () => this.updateCurSel(function (sel) { return sel.map(function () { return true; }); }),
+      selectNone: () => this.updateCurSel(function (sel) { return sel.map(function () { return false; }); }),
+      invert: () => this.updateCurSel(function (sel) { return sel.map(function (v) { return !v; }); }),
+      range: s.range, setRange: (e) => this.setState({ range: e.target.value }),
+      rangeKey: (e) => { if (e.key === 'Enter') this.applyRange(); },
+      applyRange: () => this.applyRange(),
+
+      out: s.out, setOut: (e) => this.setState({ out: e.target.value }),
+      threads: s.threads,
+      setThreads: (e) => this.setState({ threads: clampThreads(parseInt(e.target.value, 10) || 1) }),
+      incThreads: () => this.setState({ threads: clampThreads((parseInt(s.threads, 10) || 1) + 1) }),
+      decThreads: () => this.setState({ threads: clampThreads((parseInt(s.threads, 10) || 1) - 1) }),
+      mux: s.mux, keep: s.keep, merge: s.merge,
+      toggleMux: () => this.setState({ mux: !s.mux }),
+      toggleKeep: () => this.setState({ keep: !s.keep }),
+      toggleMerge: () => this.setState({ merge: !s.merge }),
+
+      totalSel: totalSel, filmsSel: filmsSel,
+      running: s.running, notRunning: !s.running,
+      startLabel: s.running ? 'Đang đồng bộ…' : 'Bắt đầu đồng bộ siêu tốc',
+      startOpacity: s.running ? '0.55' : '1', stopOpacity: s.running ? '1' : '0.45',
+      start: () => {
+        const jobs = this.buildJobs(s.series);
+        if (!jobs.length) { this.setState({ notice: 'Hãy chọn ít nhất 1 tập để đồng bộ.' }); return; }
+        this.setState({ jobs: jobs, running: true, bytes: 0, elapsed: 0, speed: 0, notice: 'Bắt đầu đồng bộ ' + jobs.length + ' tập với ' + s.threads + ' luồng…' });
+      },
+      stop: () => {
+        const jobs = s.jobs.map(function (j) { return (j.st === 'run' || j.st === 'wait') ? Object.assign({}, j, { st: 'cancel' }) : j; });
+        this.setState({ jobs: jobs, running: false, speed: 0, notice: 'Đã dừng đồng bộ.' });
+      },
+
+      nOk: nOk, nErr: nErr, nRun: nRun, nWait: nWait, nDone: nDone, nJobs: s.jobs.length,
+      pctText: pct + '%',
+      elapsedText: fmtTime(s.elapsed), bytesText: fmtBytes(s.bytes),
+      speedText: s.speed.toFixed(2),
+      rows: rows, noJobs: rows.length === 0
+    };
+  }
+}
+</script>
+</body>
+</html>

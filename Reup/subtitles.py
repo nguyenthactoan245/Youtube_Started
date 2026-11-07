@@ -62,7 +62,10 @@ def publish(source, destination):
             number += 1
 
 
-async def export_srt(videos, destination, language='auto', model='base', progress=lambda p, m: None):
+async def export_srt(videos, destination, language='auto', model='base',
+                     progress=lambda p, m: None, device='cpu'):
+    if device not in {'cpu', 'gpu'}:
+        raise ValueError('Thiết bị xử lý phải là CPU hoặc GPU.')
     interpreter = await asyncio.to_thread(check_available)
     if not any(v.audio for v in videos):
         raise ValueError('Không có âm thanh nguồn để tạo SRT.')
@@ -84,6 +87,7 @@ async def export_srt(videos, destination, language='auto', model='base', progres
         manifest = folder / 'job.json'
         result = folder / 'result.srt'
         manifest.write_text(json.dumps({'entries': entries, 'language': language, 'model': model,
+                                        'device': device,
                                         'result': str(result), 'total': total}), encoding='utf-8')
         progress(.15, 'Đang nạp mô hình nhận dạng; lần đầu cần Internet để tải mô hình...')
         with tempfile.TemporaryFile() as errors:
@@ -111,7 +115,9 @@ async def export_srt(videos, destination, language='auto', model='base', progres
 def worker(manifest):
     from faster_whisper import WhisperModel
     job = json.loads(Path(manifest).read_text(encoding='utf-8'))
-    model = WhisperModel(job['model'], device='cpu', compute_type='int8',
+    device = job.get('device', 'cpu')
+    model = WhisperModel(job['model'], device='cuda' if device == 'gpu' else 'cpu',
+                         compute_type='float16' if device == 'gpu' else 'int8',
                          download_root=str(ROOT / 'models'))
     index = 0
     with Path(job['result']).open('w', encoding='utf-8', newline='\n') as output:

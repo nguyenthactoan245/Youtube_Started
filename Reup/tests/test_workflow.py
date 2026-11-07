@@ -88,11 +88,13 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_merge_only_and_no_selection(self):
         await self.load()
         self.app.export_subtitles.value = False
+        self.app.device.value = 'gpu'
         with patch('main.probe', AsyncMock(side_effect=self.videos)), \
              patch('main.merge', AsyncMock(return_value=self.root / 'joined.mp4')) as merge, \
              patch('main.export_srt', AsyncMock()) as srt:
             await self.app.start_merge(None)
             merge.assert_awaited_once()
+            self.assertEqual(merge.await_args.kwargs['device'], 'gpu')
             srt.assert_not_awaited()
         self.app.merge_enabled.value = False
         self.app.update_options()
@@ -119,6 +121,7 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         for muted in (False, True):
             self.app.mute_audio.value = muted
             self.app.remove_music.value = not muted
+            self.app.music_ranges.value = '00:00 - 00:00.5'
             self.app.update_options()
             self.assertFalse(self.app.merge_button.disabled)
             self.assertTrue(self.app.merge_enabled.disabled)
@@ -131,7 +134,23 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(process.await_args.args[0], [self.videos[0]])
                 self.assertEqual(process.await_args.kwargs['mute_audio'], muted)
                 self.assertEqual(process.await_args.kwargs['remove_music'], not muted)
+                self.assertEqual(process.await_args.kwargs['music_ranges'], None if muted else [(0, .5)])
                 srt.assert_not_awaited()
+
+    async def test_music_ranges_only_visible_and_required_for_single_file(self):
+        await self.load()
+        self.assertFalse(self.app.music_ranges.visible)
+        await self.load(True)
+        self.assertTrue(self.app.music_ranges.visible)
+        self.app.export_subtitles.value = False
+        self.app.remove_music.value = True
+        self.app.music_ranges.value = ''
+        with patch('main.probe', AsyncMock(return_value=self.videos[0])), \
+             patch('music_removal.find_python', return_value='python'), \
+             patch('main.merge', AsyncMock()) as process:
+            await self.app.start_merge(None)
+        process.assert_not_awaited()
+        self.assertIn('ít nhất một đoạn', self.app.status.value)
 
     async def test_audio_options_are_mutually_exclusive(self):
         await self.load(True)

@@ -8,9 +8,10 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
 EXTENSIONS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.m4v', '.mts', '.ts'}
 FLAGS = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 
@@ -128,7 +129,17 @@ async def run_ffmpeg(args, duration, progress):
                 await process.wait()
     progress(1)
 
-async def merge(videos, destination, mode='auto', progress=lambda value, message: None, *, mute_audio=False, remove_music=False):
+def video_encoder_args(device):
+    """Return FFmpeg H.264 settings for the selected compute device."""
+    if device == 'cpu':
+        return ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20']
+    if device == 'gpu':
+        return ['-c:v', 'h264_nvenc', '-preset', 'p4', '-cq', '20', '-b:v', '0']
+    raise ValueError('Thiết bị xử lý phải là CPU hoặc GPU.')
+
+
+async def merge(videos, destination, mode='auto', progress=lambda value, message: None, *,
+                mute_audio=False, remove_music=False, device='cpu', music_ranges=None):
     if not videos:
         raise ValueError('Chưa có video để ghép.')
     destination = Path(destination)
@@ -158,7 +169,7 @@ async def merge(videos, destination, mode='auto', progress=lambda value, message
                     args += ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']
                 args += ['-map', f'0:{item.video["index"]}', '-vf',
                     f'setpts=PTS-STARTPTS,scale={width}:{height}:force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={rate}',
-                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+                    *video_encoder_args(device), '-pix_fmt', 'yuv420p',
                     '-video_track_timescale', '90000']
                 if with_audio:
                     args += ['-map', f'0:{item.audio["index"]}' if item.audio else '1:a:0',
@@ -200,7 +211,8 @@ async def merge(videos, destination, mode='auto', progress=lambda value, message
         if remove_music and not mute_audio and info.audio:
             from music_removal import remove_background
             filtered = temp / 'voice_only.mp4'
-            await remove_background(output, filtered, info.duration, progress)
+            await remove_background(output, filtered, info.duration, progress, device=device,
+                                    ranges=music_ranges)
             await probe(filtered)
             output = filtered
         # Exclusive publication prevents overwriting a file created while the job ran.

@@ -5,3 +5,7 @@ settings.json
 merge.log
 .test-output/
 models/
+build/
+dist/
+installer-output/
+.test-tmp/

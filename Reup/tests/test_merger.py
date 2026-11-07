@@ -4,8 +4,10 @@ import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from merger import FLAGS, compatible, executable, merge, output_path, probe, scan
+from merger import FLAGS, compatible, executable, merge, output_path, probe, scan, video_encoder_args
+from music_removal import parse_music_ranges
 
 
 class MergeTests(unittest.IsolatedAsyncioTestCase):
@@ -15,6 +17,19 @@ class MergeTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         self.temp.cleanup()
+
+    def test_cpu_and_gpu_encoder_options(self):
+        self.assertIn('libx264', video_encoder_args('cpu'))
+        self.assertIn('h264_nvenc', video_encoder_args('gpu'))
+        with self.assertRaises(ValueError):
+            video_encoder_args('other')
+
+    def test_parse_music_ranges(self):
+        self.assertEqual(parse_music_ranges('00:05 - 00:10\n00:09 - 00:12\n1:00 - 1:02.5', 70),
+                         [(5, 12), (60, 62.5)])
+        for text in ('', '00:10 - 00:05', 'bad', '00:00 - 01:20'):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_music_ranges(text, 70)
 
     def clip(self, name, color='red', size='160x120', audio=True, fps=24):
         path = self.root / name
@@ -106,11 +121,15 @@ class MergeTests(unittest.IsolatedAsyncioTestCase):
 class UIConstructionTests(unittest.TestCase):
     def test_build_controls(self):
         from main import VideoMergerApp
-        page = SimpleNamespace(window=SimpleNamespace(), services=[], add=lambda *args: None)
-        app = VideoMergerApp(page)
-        self.assertTrue(app.merge_button.disabled)
-        self.assertEqual(len(page.services), 1)
-        app.render_list()
+        with tempfile.TemporaryDirectory() as folder, \
+             patch('main.SETTINGS', Path(folder) / 'settings.json'):
+            page = SimpleNamespace(window=SimpleNamespace(), services=[], add=lambda *args: None)
+            app = VideoMergerApp(page)
+            self.assertTrue(app.merge_button.disabled)
+            self.assertTrue(page.window.maximized)
+            self.assertEqual(app.device.value, 'gpu')
+            self.assertEqual(len(page.services), 1)
+            app.render_list()
 
 
 if __name__ == '__main__':

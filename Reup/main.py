@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import sys
 import time
 
 import flet as ft
@@ -44,6 +45,7 @@ class VideoMergerApp:
         page.window.height = 800
         page.window.min_width = 850
         page.window.min_height = 650
+        page.window.maximized = True
         self.picker = ft.FilePicker()
         page.services.append(self.picker)
         self.input = ft.TextField(label='File hoặc thư mục đầu vào', value=settings.get('input', ''),
@@ -56,6 +58,10 @@ class VideoMergerApp:
         self.mode = ft.Dropdown(label='Chế độ ghép', width=220,
             value=settings.get('mode', 'auto'), options=[ft.DropdownOption('auto', 'Tự động'),
             ft.DropdownOption('fast', 'Ghép nhanh'), ft.DropdownOption('normalize', 'Chuẩn hóa')])
+        device = settings.get('device', 'gpu')
+        self.device = ft.Dropdown(label='Thiết bị xử lý', width=220,
+            value=device if device in {'cpu', 'gpu'} else 'cpu', options=[
+                ft.DropdownOption('cpu', 'CPU'), ft.DropdownOption('gpu', 'GPU (NVIDIA)')])
         self.input_button = ft.Button('Chọn folder', icon=ft.Icons.FOLDER_OPEN, on_click=self.browse_input)
         self.file_button = ft.Button('Chọn file', icon=ft.Icons.VIDEO_FILE, on_click=self.browse_file)
         self.merge_enabled = ft.Checkbox(label='Merge', value=settings.get('merge_enabled', True),
@@ -64,6 +70,9 @@ class VideoMergerApp:
             value=settings.get('mute_audio') is True, on_change=self.audio_changed)
         self.remove_music = ft.Checkbox(label='Tắt nhạc nền (giữ lời nói)',
             value=settings.get('remove_music') is True, on_change=self.audio_changed)
+        self.music_ranges = ft.TextField(label='Các đoạn tắt nhạc nền (mỗi dòng: bắt đầu - kết thúc)',
+            hint_text='00:01:20 - 00:01:28', multiline=True, min_lines=2, max_lines=4,
+            value=settings.get('music_ranges', ''), on_change=self.audio_changed, visible=False)
         self.export_subtitles = ft.Checkbox(label='Xuất SRT',
             value=settings.get('export_srt') is True, on_change=self.audio_changed)
         self.subtitle_language = ft.Dropdown(label='Ngôn ngữ lời nói', width=220,
@@ -90,9 +99,9 @@ class VideoMergerApp:
         self.progress = ft.ProgressBar(value=0, color='#2563EB', bgcolor='#DBEAFE')
         self.percent = ft.Text('0%')
         self.table = ft.ListView(expand=True, spacing=4)
-        self.settings_controls = [self.input, self.output, self.filename, self.sort, self.mode, self.mute_audio,
+        self.settings_controls = [self.input, self.output, self.filename, self.sort, self.mode, self.device, self.mute_audio,
                                   self.recursive,
-                                  self.remove_music,
+                                  self.remove_music, self.music_ranges,
                                   self.merge_enabled, self.file_button,
                                   self.export_subtitles, self.subtitle_language, self.subtitle_model,
                                   self.input_button, self.output_button, self.refresh_button]
@@ -100,9 +109,10 @@ class VideoMergerApp:
             ft.Text('VIDEO MERGER', size=28, weight=ft.FontWeight.BOLD, color='#172554'),
             ft.Text('Chọn file hoặc folder để xuất SRT, xử lý âm thanh; Merge dành cho folder.', color='#64748B'),
             ft.Row([self.input, self.file_button, self.input_button]), ft.Row([self.output, self.output_button]),
-            ft.Row([self.filename, self.mode]),
+            ft.Row([self.filename, self.mode, self.device]),
             ft.Row([self.export_subtitles, self.merge_enabled, self.mute_audio, self.remove_music],
                    wrap=False, spacing=20, scroll=ft.ScrollMode.AUTO),
+            self.music_ranges,
             ft.Row([self.subtitle_language, self.subtitle_model]),
             ft.Row([self.sort, self.recursive, self.refresh_button, self.summary]),
             ft.Container(content=ft.Column([
@@ -120,10 +130,12 @@ class VideoMergerApp:
     def save_settings(self):
         SETTINGS.write_text(json.dumps({'input': self.input.value, 'output': self.output.value,
             'filename': self.filename.value, 'sort': self.sort.value, 'mode': self.mode.value,
+            'device': self.device.value,
             'mute_audio': bool(self.mute_audio.value), 'export_srt': bool(self.export_subtitles.value),
             'merge_enabled': bool(self.merge_enabled.value),
             'recursive': bool(self.recursive.value),
             'remove_music': bool(self.remove_music.value),
+            'music_ranges': self.music_ranges.value,
             'subtitle_language': self.subtitle_language.value, 'subtitle_model': self.subtitle_model.value},
             ensure_ascii=False, indent=2), encoding='utf-8')
 
@@ -143,6 +155,8 @@ class VideoMergerApp:
             self.remove_music.value = False
         self.mute_audio.disabled = self.busy or bool(self.remove_music.value)
         self.remove_music.disabled = self.busy or bool(self.mute_audio.value)
+        self.music_ranges.visible = self.single_file
+        self.music_ranges.disabled = self.busy or not self.single_file or not self.remove_music.value
         self.mode.disabled = self.busy or not merging
         self.filename.disabled = self.busy
         self.filename.helper_text = ('Tên video ghép; SRT chung dùng cùng tên.' if merging else
@@ -315,12 +329,17 @@ class VideoMergerApp:
                 if not any(v.audio for v in fresh):
                     raise ValueError('Không có âm thanh nguồn để tạo SRT. Hãy bỏ chọn Xuất SRT.')
             if self.remove_music.value and not self.mute_audio.value and any(v.audio for v in fresh):
-                from music_removal import find_python
-                await asyncio.to_thread(find_python)
+                from music_removal import find_python, parse_music_ranges
+                await asyncio.to_thread(find_python, self.device.value)
+                music_ranges = (parse_music_ranges(self.music_ranges.value, fresh[0].duration)
+                                if self.single_file else None)
+            else:
+                music_ranges = None
             if merging:
                 self.last_output = await merge(fresh, destination, self.mode.value, self.report_progress,
                                                mute_audio=bool(self.mute_audio.value),
-                                               remove_music=bool(self.remove_music.value) and not self.mute_audio.value)
+                                               remove_music=bool(self.remove_music.value) and not self.mute_audio.value,
+                                               device=self.device.value, music_ranges=None)
                 saved_video = self.last_output
                 completed.append(saved_video)
                 self.open_button.disabled = False
@@ -332,7 +351,8 @@ class VideoMergerApp:
                     target = output_path(folder, name)
                     result = await merge([video], target, 'auto', self.report_progress,
                         mute_audio=bool(self.mute_audio.value),
-                        remove_music=bool(self.remove_music.value) and not self.mute_audio.value)
+                        remove_music=bool(self.remove_music.value) and not self.mute_audio.value,
+                        device=self.device.value, music_ranges=music_ranges)
                     individual_outputs[video.path] = result
                     completed.append(result)
                     self.last_output = result
@@ -353,7 +373,8 @@ class VideoMergerApp:
                 for index, (videos, srt_path) in enumerate(jobs):
                     saved_srt = await export_srt(videos, srt_path,
                         self.subtitle_language.value, self.subtitle_model.value,
-                        lambda p, message: self.report_progress((index + p) / len(jobs), message))
+                        lambda p, message: self.report_progress((index + p) / len(jobs), message),
+                        device=self.device.value)
                     completed.append(saved_srt)
                     self.last_output = saved_video or saved_srt
                     self.open_button.disabled = False
@@ -399,4 +420,8 @@ async def main(page: ft.Page):
         await app.refresh()
 
 if __name__ == '__main__':
-    ft.run(main)
+    if len(sys.argv) > 1 and sys.argv[1] == '--demucs-worker':
+        from music_removal import demucs_worker
+        demucs_worker(sys.argv[2:])
+    else:
+        ft.run(main)

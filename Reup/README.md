@@ -53,6 +53,12 @@ SRT vẫn được nhận dạng từ âm thanh nguồn. Tách nhạc không đ�
 và có thể ảnh hưởng chất lượng giọng nói; xử lý video dài bằng CPU có thể mất nhiều thời gian.
 Lần đầu cần Internet tải mô hình. Nếu thiếu bộ tách nhạc, chạy `install_music.bat`.
 
+Khi dùng **Chọn file**, tick **Tắt nhạc nền (giữ lời nói)** rồi nhập các đoạn cần xử lý,
+mỗi dòng theo dạng `00:01:20 - 00:01:28`. Có thể nhập nhiều dòng; các đoạn chồng nhau sẽ tự gộp.
+App chỉ chạy tách nhạc trong các đoạn đã nhập, giữ nguyên âm thanh ở phần còn lại và lưu thành video mới.
+Khoảng kết thúc không được vượt quá thời lượng video. Tính năng chọn đoạn hiện chỉ áp dụng cho một video được
+mở bằng **Chọn file**; luồng Merge folder vẫn tắt nhạc nền trên toàn bộ video kết quả.
+
 ## Tạo SRT
 
 - Chọn **Xuất SRT từ lời nói**, ngôn ngữ nguồn (hoặc Tự nhận dạng) và mô hình Base/Small,
@@ -81,6 +87,20 @@ Lần đầu cần Internet tải mô hình. Nếu thiếu bộ tách nhạc, ch
 - `merge.log`: thông tin lỗi để chẩn đoán.
 
 ## Phát triển và kiểm thử
+
+## Chọn CPU hoặc GPU
+
+Trong giao diện, mục **Thiết bị xử lý** có hai lựa chọn:
+
+- **CPU**: tương thích rộng nhất; chuẩn hóa video bằng `libx264`, tạo SRT bằng Whisper `int8`
+  và tách nhạc bằng Demucs trên CPU.
+- **GPU (NVIDIA)**: chuẩn hóa video bằng NVENC (`h264_nvenc`), tạo SRT bằng CUDA `float16`
+  và tách nhạc bằng Demucs CUDA. Máy cần card NVIDIA, driver phù hợp và bản FFmpeg có NVENC.
+
+Chế độ **Ghép nhanh** chỉ sao chép luồng video nên không dùng bộ mã hóa CPU/GPU. Nếu chọn GPU
+nhưng CUDA hoặc NVENC không khả dụng, tác vụ sẽ dừng và hiển thị lỗi; ứng dụng không tự chuyển về CPU.
+Ứng dụng mặc định mở toàn màn hình và chọn **GPU (NVIDIA)** ở lần chạy đầu tiên. Lựa chọn CPU/GPU
+đã lưu trong `settings.json` sẽ được giữ cho những lần chạy sau.
 
 ```powershell
 py -m unittest discover -s tests -v
