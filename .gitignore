@@ -1,1 +1,37 @@
+# Generated audio/video files
 *.mp3
+*.mp4
+*.m4v
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# Downloaded source media and rendered output
+/AI_Drama/Input/
+/AI_Drama/Output/
+**/downloads/
+
+# Local installers and generated build artifacts
+*.exe
+**/build/
+**/dist/
+
+# Python caches and local environments
+**/__pycache__/
+*.py[cod]
+**/.venv/
+**/venv/
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
