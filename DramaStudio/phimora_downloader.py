@@ -807,6 +807,17 @@ def download_shortical_episode(
     provider = "Shortical (EN 1080p)"
     final_mp4 = os.path.join(out_dir, f"Tap_{serial:03d}.mp4")
     temp_video = os.path.join(out_dir, f".tmp_ep_{serial:03d}_v.ts")
+    sub_vtt_path = os.path.join(out_dir, f"Tap_{serial:03d}.{lang}.vtt")
+
+    # Download the requested caption track when the provider publishes one.
+    # Shortical does not guarantee subtitles for every title/language.
+    subtitle_vtt = fetch_shortical_subtitle_vtt(series_id, serial, lang=lang)
+    has_subtitle = bool(subtitle_vtt.strip())
+    if has_subtitle:
+        with open(sub_vtt_path, "w", encoding="utf-8") as sub_file:
+            sub_file.write(subtitle_vtt)
+        if status_cb:
+            status_cb(f"Đã tải phụ đề {lang.upper()} cho tập {serial}.")
 
     # 1. Tải luồng Video + Audio Tiếng Anh gốc 1080x1920 từ CloudFront HLS
     if status_cb:
@@ -822,10 +833,17 @@ def download_shortical_episode(
     if has_ffmpeg:
         if status_cb:
             status_cb("Đang đóng gói MP4 chuẩn...")
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error", "-i", temp_video,
-            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", final_mp4
-        ]
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", temp_video]
+        if has_subtitle and mux_subs:
+            cmd += [
+                "-i", sub_vtt_path,
+                "-map", "0:v:0", "-map", "0:a:0?", "-map", "1:0",
+                "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
+                "-metadata:s:s:0", f"language={lang}",
+            ]
+        else:
+            cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]
+        cmd += ["-movflags", "+faststart", final_mp4]
         no_win = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=no_win)
 
@@ -839,6 +857,12 @@ def download_shortical_episode(
             raise RuntimeError(f"FFmpeg đóng gói lỗi: {res.stderr[:200]}")
     else:
         shutil.move(temp_video, final_mp4)
+
+    if has_subtitle and not keep_vtt and os.path.exists(sub_vtt_path):
+        try:
+            os.remove(sub_vtt_path)
+        except OSError:
+            pass
 
     return final_mp4, provider
 
@@ -1139,6 +1163,11 @@ def detect_gpu_encoder() -> dict:
             ("h264_qsv", "Intel QuickSync", ["-hwaccel", "auto"], ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "28", "-maxrate", "3500k", "-bufsize", "7000k"]),
             ("h264_mf", "Windows MediaFoundation GPU", ["-hwaccel", "auto"], ["-c:v", "h264_mf", "-rate_control", "quality", "-quality", "70"]),
         ]
+        if sys.platform == "darwin":
+            candidates = [
+                ("h264_videotoolbox", "Apple VideoToolbox", [],
+                 ["-c:v", "h264_videotoolbox", "-b:v", "3500k"]),
+            ]
 
         if shutil.which("ffmpeg"):
             for codec, label, hw_in, v_args in candidates:
@@ -1204,6 +1233,17 @@ def get_video_duration(mp4_path: str) -> float:
                     val = float(duration) / float(timescale)
                     if 0.5 <= val <= 86400:
                         return val
+    except Exception:
+        pass
+
+    try:
+        import av
+        with av.open(mp4_path) as container:
+            if container.duration and container.duration > 0:
+                return float(container.duration / av.time_base)
+            for stream in container.streams:
+                if stream.type == "video" and stream.duration and stream.time_base:
+                    return float(stream.duration * stream.time_base)
     except Exception:
         pass
 
@@ -1557,6 +1597,7 @@ def merge_episode_range(
     custom_prefix: str = "",
     status_cb=None,
     progress_cb=None,                # (pct, cur_sec, total_sec, speed_str, fps_str, size_mb, engine_label)
+    subtitle_fallback_fn=None,       # (mp4_path, duration, ep_num, ep_index, ep_total) -> WebVTT
 ) -> dict:
     """
     Ghép một dải tập (ep_numbers) trong `series_dir` thành 1 tập dài MP4 siêu tốc:
@@ -1613,6 +1654,23 @@ def merge_episode_range(
             for ep_num, dur, sub_txt in pool.map(_probe_ep, selected_eps):
                 ep_meta[ep_num] = (dur, sub_txt)
 
+        used_speech_recognition = False
+        if need_sub and subtitle_fallback_fn:
+            for ep_index, ep in enumerate(selected_eps, 1):
+                dur, raw_sub = ep_meta[ep]
+                if not raw_sub.strip():
+                    raw_sub = subtitle_fallback_fn(
+                        local_map[ep]["mp4"], dur, ep, ep_index, len(selected_eps)
+                    )
+                    ep_meta[ep] = (dur, raw_sub)
+                    used_speech_recognition = used_speech_recognition or bool(raw_sub.strip())
+
+        sub_language = "en" if used_speech_recognition else "vi"
+        if sub_language != "vi":
+            out_vtt = out_base + f".{sub_language}.vtt"
+            out_srt = out_base + f".{sub_language}.srt"
+            out_ass = out_base + f".{sub_language}.ass"
+
         total_dur_sec = 0.0
         sub_offsets = []
         for ep in selected_eps:
@@ -1634,6 +1692,13 @@ def merge_episode_range(
                     with open(out_ass, "w", encoding="utf-8") as f:
                         f.write(ass_content)
                 has_merged_sub = True
+
+        if need_sub and not has_merged_sub:
+            raise RuntimeError(
+                "Không tìm thấy phụ đề trong các tập đã chọn. "
+                "Hãy tải lại tập với tùy chọn giữ .VTT, chọn chế độ Không Sub, "
+                "hoặc tạo SRT bằng nhận dạng giọng nói trước khi ghép."
+            )
 
         # Bước 2: Ghi danh sách concat video
         ep_files = [local_map[ep]["mp4"] for ep in selected_eps]
@@ -1693,7 +1758,7 @@ def merge_episode_range(
                 "-i", out_vtt,
                 "-map", "0:v:0", "-map", "0:a:0?", "-map", "1:0",
                 "-c:v", "copy", "-c:a", "copy",
-                "-c:s", "mov_text", "-metadata:s:s:0", "language=vi",
+                "-c:s", "mov_text", "-metadata:s:s:0", f"language={sub_language}",
                 "-movflags", "+faststart",
                 out_mp4,
             ]
@@ -1709,7 +1774,7 @@ def merge_episode_range(
                     + ["-f", "concat", "-safe", "0", "-i", concat_txt, "-i", out_vtt]
                     + ["-map", "0:v:0", "-map", "0:a:0?", "-map", "1:0"]
                     + gpu_info["encode_args"]
-                    + ["-c:a", "aac", "-b:a", "128k", "-c:s", "mov_text", "-metadata:s:s:0", "language=vi", "-movflags", "+faststart", out_mp4]
+                    + ["-c:a", "aac", "-b:a", "128k", "-c:s", "mov_text", "-metadata:s:s:0", f"language={sub_language}", "-movflags", "+faststart", out_mp4]
                 )
                 rc, err_txt = _run_ffmpeg_with_progress(
                     cmd_gpu, total_dur_sec,
@@ -1771,6 +1836,7 @@ def merge_episode_range(
             "range_tag": range_tag,
             "sub_mode": sub_mode,
             "has_sub": has_merged_sub,
+            "sub_language": sub_language if has_merged_sub else "",
             "size_mb": sz_mb,
             "engine": engine_label,
         }

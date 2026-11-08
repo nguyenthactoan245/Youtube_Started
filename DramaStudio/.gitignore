@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+tests/.tmp/
 
 # Virtual environments
 .venv/
@@ -15,6 +16,9 @@ env/
 build/
 dist/
 packaging/
+releases/
+models/
+cuda-runtime/
 *.egg-info/
 
 # Downloaded/generated media

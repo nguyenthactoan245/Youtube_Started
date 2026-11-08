@@ -1,0 +1,7 @@
+requests>=2.31,<3
+cryptography>=42,<51
+pywebview>=5,<7
+ctranslate2>=4.6,<5
+sentencepiece>=0.2,<0.3
+pyinstaller>=6.10,<7
+faster-whisper>=1.2,<2
