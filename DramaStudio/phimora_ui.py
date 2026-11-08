@@ -19,6 +19,20 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+
+def configure_portable_runtime() -> str:
+    """Configure paths used by the source checkout and the portable executable."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        runtime_dir = sys._MEIPASS
+        app_dir = os.path.dirname(os.path.abspath(sys.executable))
+        os.environ["PATH"] = runtime_dir + os.pathsep + os.environ.get("PATH", "")
+    else:
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+    return app_dir
+
+
+APP_DIR = configure_portable_runtime()
+
 from phimora_downloader import (
     parse_series_page,
     expand_shortical_browse_url,
@@ -124,7 +138,7 @@ class SyncManager:
         self.elapsed = 0.0
         self.speed_ema = 0.0
         self.notice = ""
-        self.default_out = os.path.abspath("downloads")
+        self.default_out = os.path.join(APP_DIR, "downloads")
 
         # GPU & Standalone Merger Real-Time Progress State
         self.gpu_info = {"label": "Đang dò VGA...", "short_label": "VGA", "is_gpu": True}
