@@ -1,0 +1,31 @@
+name: Build DramaStudio macOS v1.0.0
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python3 -m pip install -r DramaStudio/requirements.txt pyobjc
+      - name: Run tests
+        run: python3 -m unittest discover -s DramaStudio/tests -q
+      - name: Build app and DMG
+        run: bash DramaStudio/build_mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DramaStudio-macOS-${{ matrix.arch }}-v1.0.0
+          path: DramaStudio/releases/DramaStudio-macOS-${{ matrix.arch }}-v1.0.0.dmg
