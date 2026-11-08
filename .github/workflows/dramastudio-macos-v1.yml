@@ -6,6 +6,7 @@ on:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - runner: macos-15
@@ -20,7 +21,12 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: |
-          python3 -m pip install -r DramaStudio/requirements.txt pyobjc
+          python3 -m pip install -r DramaStudio/requirements.txt \
+            pyobjc-core \
+            pyobjc-framework-Cocoa \
+            pyobjc-framework-Quartz \
+            pyobjc-framework-WebKit \
+            pyobjc-framework-Security
       - name: Run tests
         run: python3 -m unittest discover -s DramaStudio/tests -q
       - name: Build app and DMG

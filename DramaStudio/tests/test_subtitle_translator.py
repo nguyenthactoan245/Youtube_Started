@@ -271,6 +271,7 @@ class AutoMergeOptionTests(unittest.TestCase):
 
         with (
             mock.patch.object(phimora_ui, "model_is_ready", return_value=True),
+            mock.patch.object(type(phimora_ui.WHISPER), "model_ready", new_callable=mock.PropertyMock, return_value=True),
             mock.patch.object(phimora_ui, "download_episode_with_retry", side_effect=fake_download),
             mock.patch.object(phimora_ui, "merge_episode_range", side_effect=RuntimeError("ffmpeg failed")),
             mock.patch.object(phimora_ui.TRANSLATION_MGR, "snapshot", return_value={"translationRunning": False}),
@@ -355,6 +356,7 @@ class AutoMergeOptionTests(unittest.TestCase):
         }
         with (
             mock.patch.object(phimora_ui, "model_is_ready", return_value=True),
+            mock.patch.object(type(phimora_ui.WHISPER), "model_ready", new_callable=mock.PropertyMock, return_value=True),
             mock.patch.object(phimora_ui, "download_episode_with_retry", side_effect=fake_download),
             mock.patch.object(phimora_ui, "merge_episode_range", side_effect=fake_merge),
             mock.patch.object(phimora_ui.TRANSLATION_MGR, "start_translation", side_effect=fake_translate),
